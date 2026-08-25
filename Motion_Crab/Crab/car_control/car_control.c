@@ -9,7 +9,7 @@
 #include "esp_check.h"
 
 #define SQRT3_OVER_2 0.8660254037844386f
-#define STRAFE_SIDE_SPEED_RATIO 0.7f
+#define STRAFE_SIDE_SPEED_RATIO 0.6f
 
 static car_control_config_t s_config;
 static bool s_ready;
