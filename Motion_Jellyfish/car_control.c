@@ -403,7 +403,7 @@ esp_err_t car_control_backward(float speed_mps)
 
 esp_err_t car_control_strafe_left(float speed_mps)
 {
-    if (!isfinite(speed_mps) || speed_mps < 0.0f) {
+    if (!isfinite(speed_mps)) {
         return ESP_ERR_INVALID_ARG;
     }
     return start_lateral_move(-TURN_ANGLE_DEG,
@@ -412,7 +412,7 @@ esp_err_t car_control_strafe_left(float speed_mps)
 
 esp_err_t car_control_strafe_right(float speed_mps)
 {
-    if (!isfinite(speed_mps) || speed_mps < 0.0f) {
+    if (!isfinite(speed_mps)) {
         return ESP_ERR_INVALID_ARG;
     }
     return start_lateral_move(TURN_ANGLE_DEG,

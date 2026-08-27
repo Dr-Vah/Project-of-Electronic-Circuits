@@ -105,15 +105,16 @@ esp_err_t car_control_backward(float speed_mps);
 
 /**
  * Turn clockwise 30 degrees using gx feedback, then drive rear A and left B.
- * speed_mps must be non-negative. Call car_control_finish_strafe() when the
- * desired leftward travel is complete.
+ * Positive speed drives left; negative speed drives in the opposite direction.
+ * Call car_control_finish_strafe() when the desired travel is complete.
  */
 esp_err_t car_control_strafe_left(float speed_mps);
 
 /**
  * Turn counter-clockwise 30 degrees using gx feedback, then drive rear A and
- * right D. speed_mps must be non-negative. Call car_control_finish_strafe()
- * when the desired rightward travel is complete.
+ * right D. Positive speed drives right; negative speed drives in the opposite
+ * direction. Call car_control_finish_strafe() when the desired travel is
+ * complete.
  */
 esp_err_t car_control_strafe_right(float speed_mps);
 
