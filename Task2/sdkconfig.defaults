@@ -1,0 +1,18 @@
+# ESP32-S3-WROOM-2 octal PSRAM is required by the UVC frame buffers.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=150000
+
+# Bias USB host FIFO space toward camera IN traffic.
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=3000
+CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
+
+# GPIO19/20 are reserved for native USB OTG camera data.
+
+# Keep normal logs concise, but compile USB debug messages so camera
+# connection and enumeration failures can be enabled per tag at runtime.
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
