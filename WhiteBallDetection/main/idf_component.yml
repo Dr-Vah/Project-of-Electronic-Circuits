@@ -1,0 +1,5 @@
+dependencies:
+  idf: ">=5.4.0,<5.5.0"
+  espressif/esp_jpeg: "^1.2"
+  usb_host_uvc: "^2.5.1"
+
