@@ -17,6 +17,7 @@
 #include "usb/uvc_host.h"
 
 #include "camera_stream_server.h"
+#include "black_target_detector.h"
 #include "white_ball_detector.h"
 #include "white_ball_display.h"
 
@@ -112,11 +113,17 @@ static void frame_processing_task(void *argument)
         JPEG_WORK_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     white_ball_detector_t *detector = heap_caps_calloc(
         1U, sizeof(*detector), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(framebuffer != NULL && jpeg_work != NULL && detector != NULL);
+    black_target_detector_t *target_detector = heap_caps_calloc(
+        1U, sizeof(*target_detector), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(framebuffer != NULL && jpeg_work != NULL && detector != NULL &&
+           target_detector != NULL);
 
     white_ball_config_t detector_config;
     white_ball_default_config(&detector_config);
     assert(white_ball_detector_init(detector, &detector_config));
+    black_target_config_t target_config;
+    black_target_default_config(&target_config);
+    assert(black_target_detector_init(target_detector, &target_config));
 
     int64_t next_log_us = 0;
     while (true) {
@@ -148,27 +155,53 @@ static void frame_processing_task(void *argument)
             output.height <= RGB_FRAME_HEIGHT) {
             rotate_frame_180(framebuffer, output.width, output.height);
             white_ball_result_t ball = {0};
+            black_target_result_t target = {0};
             if (white_ball_detect_rgb565(detector, framebuffer, output.width,
                                          output.height, &ball)) {
+                /* Search for a stopping patch only after a ball provides a
+                 * spatial anchor, avoiding unrelated room shadows. */
                 if (ball.valid) {
-                    /* Detection runs after a 180-degree rotation, while the
-                     * browser receives the original JPEG. Convert the box
-                     * back to the browser image orientation. */
-                    camera_stream_server_publish_detection(
-                        true,
-                        1.0f - (float)(ball.right + 1U) / output.width,
-                        1.0f - (float)(ball.bottom + 1U) / output.height,
-                        1.0f - (float)ball.left / output.width,
-                        1.0f - (float)ball.top / output.height,
-                        ball.confidence);
+                    black_target_detect_rgb565(
+                        target_detector, framebuffer, output.width,
+                        output.height, ball.center_x, ball.center_y, &target);
                 } else {
-                    camera_stream_server_publish_detection(
-                        false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+                    black_target_detector_init(target_detector,
+                                               &target_config);
                 }
+
+                /* Detection uses the 180-degree corrected frame while the
+                 * browser receives the raw JPEG. Convert both boxes back. */
+                float ball_left = 0.0f, ball_top = 0.0f;
+                float ball_right = 0.0f, ball_bottom = 0.0f;
+                float target_left = 0.0f, target_top = 0.0f;
+                float target_right = 0.0f, target_bottom = 0.0f;
+                if (ball.valid) {
+                    ball_left =
+                        1.0f - (float)(ball.right + 1U) / output.width;
+                    ball_top =
+                        1.0f - (float)(ball.bottom + 1U) / output.height;
+                    ball_right = 1.0f - (float)ball.left / output.width;
+                    ball_bottom = 1.0f - (float)ball.top / output.height;
+                }
+                if (target.valid) {
+                    target_left =
+                        1.0f - (float)(target.right + 1U) / output.width;
+                    target_top =
+                        1.0f - (float)(target.bottom + 1U) / output.height;
+                    target_right =
+                        1.0f - (float)target.left / output.width;
+                    target_bottom =
+                        1.0f - (float)target.top / output.height;
+                }
+                camera_stream_server_publish_detection(
+                    ball.valid, ball_left, ball_top, ball_right, ball_bottom,
+                    ball.confidence, target.valid, target_left, target_top,
+                    target_right, target_bottom);
                 ESP_ERROR_CHECK_WITHOUT_ABORT(
                     white_ball_display_show_rgb565(
                         framebuffer, output.width, output.height,
-                        detector_config.rgb565_byte_swapped, &ball));
+                        detector_config.rgb565_byte_swapped, &ball,
+                        &target));
                 const int64_t now_us = esp_timer_get_time();
                 if (now_us >= next_log_us) {
                     next_log_us = now_us + 500000LL;
@@ -177,7 +210,8 @@ static void frame_processing_task(void *argument)
                              "center=(%+.2f,%.2f) area=%u diameter=%.1f "
                              "local_luma=%.1f local_chroma=%.1f "
                              "edge=%.2f shadow=%.2f "
-                             "confidence=%.2f",
+                             "confidence=%.2f black=%d center=(%+.2f,%.2f) "
+                             "area=%u",
                              ball.valid, ball.luma_threshold,
                              detector_config.local_highlight_difference,
                              ball.chroma_threshold,
@@ -186,12 +220,14 @@ static void frame_processing_task(void *argument)
                              ball.luma_contrast,
                              ball.chroma_contrast,
                              ball.circular_edge_score, ball.shadow_score,
-                             ball.confidence);
+                             ball.confidence, target.valid, target.center_x,
+                             target.center_y, target.area_px);
                 }
             }
         } else {
             camera_stream_server_publish_detection(
-                false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+                false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                false, 0.0f, 0.0f, 0.0f, 0.0f);
             ESP_LOGW(TAG, "JPEG decode failed: %s, output=%ux%u",
                      esp_err_to_name(decode_result), output.width,
                      output.height);
