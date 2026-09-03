@@ -6,8 +6,12 @@
 namespace {
 
 constexpr uint8_t kRequiredConfirmationFrames = 2U;
-constexpr uint8_t kMaximumBridgedMisses = 1U;
-constexpr uint16_t kMaximumCenterJumpPx = 24U;
+constexpr uint8_t kMaximumBridgedMisses = 3U;
+constexpr uint8_t kMaximumInitialConfirmationMisses = 1U;
+/* Initial acquisition stays strict so two different white circles cannot
+ * form one confirmation. After lock, the bounded local search window in
+ * ball_detector.c is the position fence. */
+constexpr uint16_t kInitialMaximumCenterJumpPx = 16U;
 
 uint16_t clamp_u16(uint32_t value)
 {
@@ -28,15 +32,14 @@ uint16_t add_clamped(uint16_t value, uint16_t amount, size_t limit)
 bool is_same_locked_ball(const ball_detection_t &locked,
                          const ball_detection_t &detected)
 {
-    const int dx = static_cast<int>(detected.x) - locked.x;
-    const int dy = static_cast<int>(detected.y) - locked.y;
-    const int permitted_jump = kMaximumCenterJumpPx + locked.radius / 2U;
+    /* Position is already bounded by the local search window. Do not reject
+     * a valid in-window ball merely because rotation moved it a long way
+     * between frames; retain radius continuity as the identity check. */
     const uint16_t smaller = detected.radius < locked.radius
         ? detected.radius : locked.radius;
     const uint16_t larger = detected.radius > locked.radius
         ? detected.radius : locked.radius;
-    return dx * dx + dy * dy <= permitted_jump * permitted_jump &&
-           smaller > 0U && larger <= 2U * smaller + 2U;
+    return smaller > 0U && larger <= 2U * smaller + 2U;
 }
 
 white_ball_result_t adapt_detection(const white_ball_detector_t *detector,
@@ -75,11 +78,21 @@ white_ball_result_t adapt_detection(const white_ball_detector_t *detector,
 void record_miss(white_ball_detector_t *detector,
                  white_ball_result_t *result)
 {
-    const ball_detector_result_t missing = {};
-    ball_detector_tracker_update(&detector->tracker, &missing, nullptr);
     if (detector->consecutive_misses < UINT8_MAX) {
         ++detector->consecutive_misses;
     }
+
+    /* Before the first stable lock, accept two nearby detections in a
+     * three-frame window. A single marginal MJPEG frame therefore does not
+     * erase the first confirmation, while two misses still reset it. */
+    if (!detector->have_search_hint && detector->tracker.has_candidate &&
+        detector->tracker.consecutive_frames > 0U &&
+        detector->consecutive_misses <= kMaximumInitialConfirmationMisses) {
+        return;
+    }
+
+    const ball_detector_result_t missing = {};
+    ball_detector_tracker_update(&detector->tracker, &missing, nullptr);
 
     /* The first dropped frame keeps the locked result. The second releases
      * the local-search hint, matching the teammate detector task. */
@@ -91,13 +104,19 @@ void record_miss(white_ball_detector_t *detector,
         return;
     }
 
-    detector->have_search_hint = false;
+    if (detector->have_search_hint) {
+        /* A stable white-ball lock is permanent for this leg. Publish an
+         * invalid result after the one-frame bridge, but retain the local
+         * hint so a remote reflection can never take over the identity. */
+        return;
+    }
+
     memset(&detector->search_hint, 0, sizeof(detector->search_hint));
     memset(&detector->last_stable_result, 0,
            sizeof(detector->last_stable_result));
     ball_detector_tracker_init(&detector->tracker,
                                kRequiredConfirmationFrames,
-                               kMaximumCenterJumpPx);
+                               kInitialMaximumCenterJumpPx);
 }
 
 }  // namespace
@@ -136,7 +155,7 @@ extern "C" bool white_ball_detector_init(
     detector->config = *config;
     ball_detector_tracker_init(&detector->tracker,
                                kRequiredConfirmationFrames,
-                               kMaximumCenterJumpPx);
+                               kInitialMaximumCenterJumpPx);
     return true;
 }
 
@@ -168,6 +187,20 @@ extern "C" bool white_ball_detect_rgb565(
     }
 
     detector->consecutive_misses = 0U;
+    if (detector->have_search_hint) {
+        /* The stable lock was already confirmed. Adopt the current local
+         * detection immediately instead of smoothing toward it over several
+         * frames; otherwise the search centre lags behind a turning camera. */
+        detector->search_hint = raw.ball;
+        detector->tracker.candidate = raw.ball;
+        detector->tracker.has_candidate = true;
+        detector->tracker.consecutive_frames = kRequiredConfirmationFrames;
+        *result = adapt_detection(detector, raw.ball, width, height);
+        result->confirmation_count = kRequiredConfirmationFrames;
+        detector->last_stable_result = *result;
+        return true;
+    }
+
     ball_detection_t stable = {};
     if (!ball_detector_tracker_update(&detector->tracker, &raw, &stable)) {
         /* After one bridged miss the tracker needs one frame to rebuild its

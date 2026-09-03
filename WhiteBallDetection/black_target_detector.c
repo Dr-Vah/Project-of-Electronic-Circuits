@@ -57,7 +57,10 @@ void black_target_default_config(black_target_config_t *config)
         /* Door/furniture shadows occupy the first 10% after rotation. */
         .roi_top_fraction = 0.10f,
         .roi_bottom_fraction = 0.92f,
-        .required_confirmation_frames = 2U,
+        /* The transport controller independently requires two stable scene
+         * frames. Do not duplicate that delay here: a thin distant patch can
+         * fragment differently in consecutive MJPEG frames. */
+        .required_confirmation_frames = 1U,
     };
 }
 
@@ -145,9 +148,12 @@ bool black_target_detect_rgb565(black_target_detector_t *detector,
                 if (cy < current.top) current.top = (uint16_t)cy;
                 if (cy > current.bottom) current.bottom = (uint16_t)cy;
 
-                const int dx[4] = {-1, 1, 0, 0};
-                const int dy[4] = {0, 0, -1, 1};
-                for (size_t n = 0U; n < 4U; ++n) {
+                /* Eight-neighbour connectivity keeps the slanted edge of a
+                 * distant, roughly five-pixel-high stopping patch together
+                 * despite RGB565/JPEG stair-stepping. */
+                const int dx[8] = {-1, 1, 0, 0, -1, -1, 1, 1};
+                const int dy[8] = {0, 0, -1, 1, -1, 1, -1, 1};
+                for (size_t n = 0U; n < 8U; ++n) {
                     const int nx = (int)cx + dx[n];
                     const int ny = (int)cy + dy[n];
                     if (nx < 0 || ny < (int)y0 || nx >= (int)width ||
@@ -191,10 +197,21 @@ bool black_target_detect_rgb565(black_target_detector_t *detector,
             const bool is_near_selected_ball =
                 target_locked || !isfinite(preferred_center_y) ||
                 preferred_center_y - component_center_y <= 0.30f;
+            /* Before the first lock, the stopping patch must be on the same
+             * side of the optical image centre as its ball. Initially the
+             * white ball/patch are together on one side and the orange pair
+             * on the other. If the correct patch is missed for one frame,
+             * wait for it instead of locking the opposite patch. Near the
+             * centre use the normal nearest-horizontal selection. */
+            const bool is_on_selected_ball_side =
+                target_locked || !isfinite(preferred_center_x) ||
+                fabsf(preferred_center_x) < 0.06f ||
+                component_center_x * preferred_center_x >= 0.0f;
             if (current.area >= detector->config.minimum_area_px &&
                 fraction <= detector->config.maximum_area_fraction &&
                 lies_beyond_selected_ball &&
-                is_near_selected_ball && matches_lock &&
+                is_near_selected_ball && is_on_selected_ball_side &&
+                matches_lock &&
                 selection_distance < best_selection_distance) {
                 best = current;
                 best_selection_distance = selection_distance;

@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -20,6 +21,7 @@
 #include "camera_stream_server.h"
 #include "black_target_detector.h"
 #include "ball_transport_controller.h"
+#include "orange_ball_detector.h"
 #include "white_ball_detector.h"
 #include "white_ball_display.h"
 
@@ -135,19 +137,32 @@ static void frame_processing_task(void *argument)
         JPEG_WORK_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     white_ball_detector_t *detector = heap_caps_calloc(
         1U, sizeof(*detector), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    black_target_detector_t *target_detector = heap_caps_calloc(
-        1U, sizeof(*target_detector), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    orange_ball_detector_t *orange_detector = heap_caps_calloc(
+        1U, sizeof(*orange_detector), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    black_target_detector_t *target_detectors = heap_caps_calloc(
+        2U, sizeof(*target_detectors), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(framebuffer != NULL && jpeg_work != NULL && detector != NULL &&
-           target_detector != NULL);
+           orange_detector != NULL && target_detectors != NULL);
 
     white_ball_config_t detector_config;
     white_ball_default_config(&detector_config);
     assert(white_ball_detector_init(detector, &detector_config));
+    orange_ball_config_t orange_config;
+    orange_ball_default_config(&orange_config);
+    assert(orange_ball_detector_init(orange_detector, &orange_config));
     black_target_config_t target_config;
     black_target_default_config(&target_config);
-    assert(black_target_detector_init(target_detector, &target_config));
+    assert(black_target_detector_init(&target_detectors[BALL_COLOR_WHITE],
+                                      &target_config));
+    assert(black_target_detector_init(&target_detectors[BALL_COLOR_ORANGE],
+                                      &target_config));
 
     int64_t next_log_us = 0;
+    ball_color_t previous_color = BALL_COLOR_WHITE;
+    bool have_ball_anchor[2] = {false, false};
+    float ball_anchor_x[2] = {0.0f, 0.0f};
+    float ball_anchor_y[2] = {0.0f, 0.0f};
+    bool target_label_announced[2] = {false, false};
     while (true) {
         uvc_host_frame_t *frame = NULL;
         if (xQueueReceive(s_frame_queue, &frame, portMAX_DELAY) != pdPASS) {
@@ -175,35 +190,83 @@ static void frame_processing_task(void *argument)
         const esp_err_t decode_result = esp_jpeg_decode(&jpeg_config, &output);
         if (decode_result == ESP_OK && output.width <= RGB_FRAME_WIDTH &&
             output.height <= RGB_FRAME_HEIGHT) {
-            white_ball_result_t ball = {0};
-            black_target_result_t target = {0};
-            const bool ball_detection_ok = white_ball_detect_rgb565(
-                detector, framebuffer, output.width, output.height, &ball);
+            white_ball_result_t balls[2] = {0};
+            black_target_result_t targets[2] = {0};
+            const ball_color_t active_color =
+                ball_transport_controller_requested_color();
+            if (active_color != previous_color) {
+                previous_color = active_color;
+                ESP_LOGI(TAG,
+                         "vision switched to orange ball; using target "
+                         "label captured at start");
+            }
+            bool detection_ok[2] = {true, true};
+            if (active_color == BALL_COLOR_WHITE) {
+                detection_ok[BALL_COLOR_WHITE] = white_ball_detect_rgb565(
+                    detector, framebuffer, output.width, output.height,
+                    &balls[BALL_COLOR_WHITE]);
+                /* While still at the start, detect the orange ball as well
+                 * so its same-side black patch gets a permanent independent
+                 * label before the chassis changes viewpoint. */
+                detection_ok[BALL_COLOR_ORANGE] = orange_ball_detect_rgb565(
+                    orange_detector, framebuffer, output.width, output.height,
+                    &balls[BALL_COLOR_ORANGE]);
+            } else {
+                detection_ok[BALL_COLOR_ORANGE] = orange_ball_detect_rgb565(
+                    orange_detector, framebuffer, output.width, output.height,
+                    &balls[BALL_COLOR_ORANGE]);
+            }
             rotate_frame_180(framebuffer, output.width, output.height);
-            rotate_ball_result_180(&ball, output.width, output.height);
-            if (ball_detection_ok) {
-                /* Keep the last confirmed ball position as the target-search
-                 * anchor. Once the chassis captures the ball it is normally
-                 * hidden below the camera, but the already selected stopping
-                 * patch must remain observable for the rest of the push. */
-                static bool have_ball_anchor;
-                static float ball_anchor_x;
-                static float ball_anchor_y;
-                if (ball.valid) {
-                    have_ball_anchor = true;
-                    ball_anchor_x = ball.center_x;
-                    ball_anchor_y = ball.center_y;
-                    black_target_detect_rgb565(
-                        target_detector, framebuffer, output.width,
-                        output.height, ball.center_x, ball.center_y, &target);
-                } else if (have_ball_anchor) {
-                    black_target_detect_rgb565(
-                        target_detector, framebuffer, output.width,
-                        output.height, ball_anchor_x, ball_anchor_y, &target);
+            rotate_ball_result_180(&balls[BALL_COLOR_WHITE],
+                                   output.width, output.height);
+            rotate_ball_result_180(&balls[BALL_COLOR_ORANGE],
+                                   output.width, output.height);
+            const bool map_both_targets = active_color == BALL_COLOR_WHITE;
+            for (int color = BALL_COLOR_WHITE;
+                 color <= BALL_COLOR_ORANGE; ++color) {
+                if (!detection_ok[color] ||
+                    (!map_both_targets && color != active_color)) {
+                    continue;
                 }
+                if (balls[color].valid) {
+                    have_ball_anchor[color] = true;
+                    ball_anchor_x[color] = balls[color].center_x;
+                    ball_anchor_y[color] = balls[color].center_y;
+                }
+                if (have_ball_anchor[color]) {
+                    black_target_detect_rgb565(
+                        &target_detectors[color], framebuffer, output.width,
+                        output.height, ball_anchor_x[color],
+                        ball_anchor_y[color], &targets[color]);
+                }
+                if (targets[color].valid &&
+                    !target_label_announced[color]) {
+                    target_label_announced[color] = true;
+                    ESP_LOGI(TAG,
+                             "start target labelled: %s target at "
+                             "(%+.2f,%.2f), area=%u",
+                             color == BALL_COLOR_WHITE ? "LEFT/WHITE"
+                                                       : "RIGHT/ORANGE",
+                             targets[color].center_x,
+                             targets[color].center_y,
+                             targets[color].area_px);
+                }
+            }
+
+            white_ball_result_t ball = balls[active_color];
+            black_target_result_t target = targets[active_color];
+            if (active_color == BALL_COLOR_WHITE &&
+                !(target_label_announced[BALL_COLOR_WHITE] &&
+                  target_label_announced[BALL_COLOR_ORANGE])) {
+                /* Do not leave the start until both world-side target labels
+                 * are known. This prevents reassignment after the turn. */
+                memset(&target, 0, sizeof(target));
+            }
+            const bool ball_detection_ok = detection_ok[active_color];
+            if (ball_detection_ok) {
                 const int64_t frame_time_us = esp_timer_get_time();
                 ball_transport_controller_submit(
-                    &ball, &target, output.width, output.height,
+                    &ball, &target, active_color, output.width, output.height,
                     frame_time_us);
                 /* Detection runs after a 180-degree rotation, while the
                  * browser receives the original JPEG. Convert both boxes
@@ -243,12 +306,17 @@ static void frame_processing_task(void *argument)
                 if (now_us >= next_log_us) {
                     next_log_us = now_us + 1500000LL;
                     ESP_LOGI(TAG,
-                             "white=%d detector=BallDet confirm=%u "
+                             "%s=%d detector=%s confirm=%u "
                              "center=(%+.2f,%.2f) area=%u diameter=%.1f "
                              "circle_support=%.2f confidence=%.2f "
                              "black=%d center=(%+.2f,%.2f) "
                              "area=%u",
-                             ball.valid, ball.confirmation_count, ball.center_x,
+                             active_color == BALL_COLOR_WHITE
+                                 ? "white" : "orange",
+                             ball.valid,
+                             active_color == BALL_COLOR_WHITE
+                                 ? "BallDet" : "OrangeCC",
+                             ball.confirmation_count, ball.center_x,
                              ball.center_y, ball.area_px, ball.diameter_px,
                              ball.circular_edge_score, ball.confidence,
                              target.valid, target.center_x,
@@ -419,7 +487,7 @@ static void usb_library_task(void *argument)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "white-ball straight transport starting");
+    ESP_LOGI(TAG, "two-ball transport starting (white, then orange)");
     ESP_ERROR_CHECK(white_ball_display_init());
     if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0U) {
         ESP_LOGE(TAG, "PSRAM unavailable");

@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS "main.c" "camera_stream_server.c" "ball_transport_controller.c"
          "../white_ball_detector.cpp" "../ball_detector.c"
+         "../orange_ball_detector.c"
          "../black_target_detector.c"
          "../white_ball_display.c"
     INCLUDE_DIRS ".."

@@ -111,13 +111,21 @@ esp_err_t ball_detector_process_rgb565(const uint16_t *pixels,
     const int hint_y = local_search ? (int)search_hint->y * work_h / height : 0;
     const int hint_r = local_search ? imax(1,
         (int)search_hint->radius * work_w / width) : 0;
-    const int tracking_half_window = imax(32, hint_r * 2);
+    /* Once locked, search a wider neighbourhood around that same physical
+     * ball. This is still a bounded local window and never becomes a new
+     * full-frame search, so distant white circular objects cannot take over. */
+    const int tracking_half_window = imax(64, (3 * hint_r + 1) / 2);
     int32_t best_score = INT32_MIN;
     int best_x = 0, best_y = 0, best_r = 0, best_support = 0;
 
     for (int r = min_r; r <= max_r; ++r) {
         const int margin = (3 * r + 1) / 2 + 2;
         for (int cy = margin; cy + margin < work_h; cy += 2) {
+            /* In the installed upside-down camera view, both balls lie on
+             * the white foam in the upper 72% of the raw frame and move
+             * farther upward as the chassis approaches. Specular spots on
+             * the exposed tile below the foam must never become candidates. */
+            if (cy * 100 > work_h * 72) continue;
             if (local_search && iabs(cy - hint_y) > tracking_half_window) continue;
             const int expected_320 = imax(6, imin(15,
                 15 - 11 * cy / work_h));
@@ -149,6 +157,7 @@ esp_err_t ball_detector_process_rgb565(const uint16_t *pixels,
                 int quadrant[4] = {0};
                 int upper = 0, lower = 0, upper_n = 0, lower_n = 0;
                 int outer_sum = 0, inner_sum = 0, chroma_sum = 0, outer_texture = 0;
+                int foam_support = 0;
                 for (int k = 0; k < BALL_SAMPLES; ++k) {
                     const int bx = cx + (r * s_ux[k] + 512) / 1024;
                     const int by = cy + (r * s_uy[k] + 512) / 1024;
@@ -167,17 +176,24 @@ esp_err_t ball_detector_process_rgb565(const uint16_t *pixels,
                     const int oy = cy + (r*11*s_uy[k] + 5120) / 10240;
                     const int tx = cx + (r*3*s_ux[k] + 1024) / 2048;
                     const int ty = cy + (r*3*s_uy[k] + 1024) / 2048;
+                    const int fx = cx + (r*27*s_ux[k] + 10240) / 20480;
+                    const int fy = cy + (r*27*s_uy[k] + 10240) / 20480;
                     const int value = gray[(size_t)iy*work_w+ix];
                     inner_sum += value;
                     chroma_sum += chroma[(size_t)iy*work_w+ix];
                     outer_sum += gray[(size_t)oy*work_w+ox];
                     outer_texture += iabs(gx[(size_t)ty*work_w+tx]) + iabs(gy[(size_t)ty*work_w+tx]);
+                    const size_t fp = (size_t)fy * work_w + fx;
+                    /* The orange ball lowers camera auto-exposure, so use an
+                     * exposure-tolerant white/grey foam test here. */
+                    if (gray[fp] >= 145 && chroma[fp] <= 30) ++foam_support;
                     if (s_uy[k] < -300) { upper += value; ++upper_n; }
                     if (s_uy[k] > 300) { lower += value; ++lower_n; }
                 }
                 int min_quadrant = quadrant[0];
                 for (int q = 1; q < 4; ++q) min_quadrant = imin(min_quadrant, quadrant[q]);
-                if (support < 13 || min_quadrant < 1 || top_positive < 2 || bottom_negative < 2) continue;
+                if (support < 13 || min_quadrant < 1 || top_positive < 2 ||
+                    bottom_negative < 2 || foam_support < 20) continue;
                 const int upper_mean = upper / upper_n;
                 const int lower_mean = lower / lower_n;
                 const int inner_mean = inner_sum / BALL_SAMPLES;
