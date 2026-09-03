@@ -3,7 +3,7 @@
 #include <math.h>
 #include <string.h>
 
-#define MAXIMUM_BRIDGED_MISSES 2U
+#define MAXIMUM_BRIDGED_MISSES 4U
 
 typedef struct {
     uint16_t area;
@@ -56,8 +56,8 @@ void black_target_default_config(black_target_config_t *config)
          * appear near the top, while furniture moves toward the bottom. */
         /* Door/furniture shadows occupy the first 10% after rotation. */
         .roi_top_fraction = 0.10f,
-        .roi_bottom_fraction = 0.78f,
-        .required_confirmation_frames = 3U,
+        .roi_bottom_fraction = 0.92f,
+        .required_confirmation_frames = 2U,
     };
 }
 
@@ -113,7 +113,10 @@ bool black_target_detect_rgb565(black_target_detector_t *detector,
     }
 
     component_t best = {0};
-    float best_horizontal_distance = INFINITY;
+    float best_selection_distance = INFINITY;
+    const bool target_locked = detector->previous_candidate.valid &&
+        detector->confirmation_count >=
+            detector->config.required_confirmation_frames;
     for (size_t y = y0; y < y1; ++y) {
         for (size_t x = 0U; x < width; ++x) {
             const size_t seed = y * width + x;
@@ -167,25 +170,34 @@ bool black_target_detect_rgb565(black_target_detector_t *detector,
             const float component_center_y =
                 ((float)current.sum_y / current.area + 0.5f) /
                 (float)height;
-            const float horizontal_distance =
-                isfinite(preferred_center_x)
-                    ? fabsf(component_center_x - preferred_center_x)
-                    : 0.0f;
+            const float horizontal_distance = isfinite(preferred_center_x)
+                ? fabsf(component_center_x - preferred_center_x) : 0.0f;
+            const float lock_dx = target_locked
+                ? fabsf(component_center_x -
+                         detector->previous_candidate.center_x) : 0.0f;
+            const float lock_dy = target_locked
+                ? fabsf(component_center_y -
+                         detector->previous_candidate.center_y) : 0.0f;
+            const bool matches_lock = !target_locked ||
+                (lock_dx <= 0.28f && lock_dy <= 0.20f);
+            const float selection_distance = target_locked
+                ? lock_dx + lock_dy
+                : (isfinite(preferred_center_x)
+                       ? horizontal_distance
+                       : -(float)current.area);
             const bool lies_beyond_selected_ball =
-                !isfinite(preferred_center_y) ||
+                target_locked || !isfinite(preferred_center_y) ||
                 component_center_y + 0.04f < preferred_center_y;
             const bool is_near_selected_ball =
-                !isfinite(preferred_center_y) ||
+                target_locked || !isfinite(preferred_center_y) ||
                 preferred_center_y - component_center_y <= 0.30f;
             if (current.area >= detector->config.minimum_area_px &&
                 fraction <= detector->config.maximum_area_fraction &&
                 lies_beyond_selected_ball &&
-                is_near_selected_ball &&
-                ((isfinite(preferred_center_x) &&
-                  horizontal_distance < best_horizontal_distance) ||
-                 (!isfinite(preferred_center_x) && current.area > best.area))) {
+                is_near_selected_ball && matches_lock &&
+                selection_distance < best_selection_distance) {
                 best = current;
-                best_horizontal_distance = horizontal_distance;
+                best_selection_distance = selection_distance;
             }
         }
     }
@@ -203,10 +215,12 @@ bool black_target_detect_rgb565(black_target_detector_t *detector,
             }
             return true;
         }
-        detector->confirmation_count = 0U;
-        detector->missed_frames = 0U;
-        memset(&detector->previous_candidate, 0,
-               sizeof(detector->previous_candidate));
+        if (!target_locked) {
+            detector->confirmation_count = 0U;
+            detector->missed_frames = 0U;
+            memset(&detector->previous_candidate, 0,
+                   sizeof(detector->previous_candidate));
+        }
         return true;
     }
 

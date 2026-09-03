@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ball_detector.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -54,14 +56,14 @@ typedef struct {
     float roi_bottom_fraction;
 } white_ball_config_t;
 
-/* Detector working memory. Allocate this once, not on a small task stack. */
+/* Adapter state for the circular-gradient detector. */
 typedef struct {
     white_ball_config_t config;
-    uint8_t mask[WHITE_BALL_MAX_PIXELS];
-    uint16_t queue[WHITE_BALL_MAX_PIXELS];
-    white_ball_result_t previous_candidate;
-    uint8_t confirmation_count;
-    uint8_t missed_frames;
+    ball_detector_tracker_t tracker;
+    ball_detection_t search_hint;
+    white_ball_result_t last_stable_result;
+    bool have_search_hint;
+    uint8_t consecutive_misses;
 } white_ball_detector_t;
 
 void white_ball_default_config(white_ball_config_t *config);
@@ -72,8 +74,8 @@ bool white_ball_detector_init(white_ball_detector_t *detector,
 /**
  * Detect the most likely white ball in an RGB565 frame.
  *
- * The detector uses low saturation relative to the local paper background,
- * connected-component shape, circular edge evidence and nearby shadow support.
+ * The detector uses the teammate BallDet circular Sobel-gradient scorer, then
+ * adapts its circle output to the transport controller's existing result type.
  * It performs no camera, motor or patrol control.
  */
 bool white_ball_detect_rgb565(white_ball_detector_t *detector,
@@ -87,4 +89,3 @@ bool white_ball_detect_rgb565(white_ball_detector_t *detector,
 #endif
 
 #endif
-

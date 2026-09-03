@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -18,6 +19,7 @@
 
 #include "camera_stream_server.h"
 #include "black_target_detector.h"
+#include "ball_transport_controller.h"
 #include "white_ball_detector.h"
 #include "white_ball_display.h"
 
@@ -92,6 +94,26 @@ static void rotate_frame_180(uint16_t *pixels, size_t width, size_t height)
 #endif
 }
 
+static void rotate_ball_result_180(white_ball_result_t *ball,
+                                   size_t width, size_t height)
+{
+#if CAMERA_ROTATE_180
+    if (ball == NULL || !ball->valid) return;
+    const uint16_t old_left = ball->left;
+    const uint16_t old_top = ball->top;
+    ball->left = (uint16_t)(width - 1U - ball->right);
+    ball->right = (uint16_t)(width - 1U - old_left);
+    ball->top = (uint16_t)(height - 1U - ball->bottom);
+    ball->bottom = (uint16_t)(height - 1U - old_top);
+    ball->center_x = -ball->center_x;
+    ball->center_y = 1.0f - ball->center_y;
+#else
+    (void)ball;
+    (void)width;
+    (void)height;
+#endif
+}
+
 static bool frame_callback(const uvc_host_frame_t *frame, void *user_context)
 {
     (void)user_context;
@@ -153,24 +175,39 @@ static void frame_processing_task(void *argument)
         const esp_err_t decode_result = esp_jpeg_decode(&jpeg_config, &output);
         if (decode_result == ESP_OK && output.width <= RGB_FRAME_WIDTH &&
             output.height <= RGB_FRAME_HEIGHT) {
-            rotate_frame_180(framebuffer, output.width, output.height);
             white_ball_result_t ball = {0};
             black_target_result_t target = {0};
-            if (white_ball_detect_rgb565(detector, framebuffer, output.width,
-                                         output.height, &ball)) {
-                /* Search for a stopping patch only after a ball provides a
-                 * spatial anchor, avoiding unrelated room shadows. */
+            const bool ball_detection_ok = white_ball_detect_rgb565(
+                detector, framebuffer, output.width, output.height, &ball);
+            rotate_frame_180(framebuffer, output.width, output.height);
+            rotate_ball_result_180(&ball, output.width, output.height);
+            if (ball_detection_ok) {
+                /* Keep the last confirmed ball position as the target-search
+                 * anchor. Once the chassis captures the ball it is normally
+                 * hidden below the camera, but the already selected stopping
+                 * patch must remain observable for the rest of the push. */
+                static bool have_ball_anchor;
+                static float ball_anchor_x;
+                static float ball_anchor_y;
                 if (ball.valid) {
+                    have_ball_anchor = true;
+                    ball_anchor_x = ball.center_x;
+                    ball_anchor_y = ball.center_y;
                     black_target_detect_rgb565(
                         target_detector, framebuffer, output.width,
                         output.height, ball.center_x, ball.center_y, &target);
-                } else {
-                    black_target_detector_init(target_detector,
-                                               &target_config);
+                } else if (have_ball_anchor) {
+                    black_target_detect_rgb565(
+                        target_detector, framebuffer, output.width,
+                        output.height, ball_anchor_x, ball_anchor_y, &target);
                 }
-
-                /* Detection uses the 180-degree corrected frame while the
-                 * browser receives the raw JPEG. Convert both boxes back. */
+                const int64_t frame_time_us = esp_timer_get_time();
+                ball_transport_controller_submit(
+                    &ball, &target, output.width, output.height,
+                    frame_time_us);
+                /* Detection runs after a 180-degree rotation, while the
+                 * browser receives the original JPEG. Convert both boxes
+                 * back to the browser orientation and publish atomically. */
                 float ball_left = 0.0f, ball_top = 0.0f;
                 float ball_right = 0.0f, ball_bottom = 0.0f;
                 float target_left = 0.0f, target_top = 0.0f;
@@ -202,25 +239,19 @@ static void frame_processing_task(void *argument)
                         framebuffer, output.width, output.height,
                         detector_config.rgb565_byte_swapped, &ball,
                         &target));
-                const int64_t now_us = esp_timer_get_time();
+                const int64_t now_us = frame_time_us;
                 if (now_us >= next_log_us) {
-                    next_log_us = now_us + 500000LL;
+                    next_log_us = now_us + 1500000LL;
                     ESP_LOGI(TAG,
-                             "white=%d luma>=%u|local+%u chroma<=%u confirm=%u "
+                             "white=%d detector=BallDet confirm=%u "
                              "center=(%+.2f,%.2f) area=%u diameter=%.1f "
-                             "local_luma=%.1f local_chroma=%.1f "
-                             "edge=%.2f shadow=%.2f "
-                             "confidence=%.2f black=%d center=(%+.2f,%.2f) "
+                             "circle_support=%.2f confidence=%.2f "
+                             "black=%d center=(%+.2f,%.2f) "
                              "area=%u",
-                             ball.valid, ball.luma_threshold,
-                             detector_config.local_highlight_difference,
-                             ball.chroma_threshold,
-                             ball.confirmation_count, ball.center_x,
+                             ball.valid, ball.confirmation_count, ball.center_x,
                              ball.center_y, ball.area_px, ball.diameter_px,
-                             ball.luma_contrast,
-                             ball.chroma_contrast,
-                             ball.circular_edge_score, ball.shadow_score,
-                             ball.confidence, target.valid, target.center_x,
+                             ball.circular_edge_score, ball.confidence,
+                             target.valid, target.center_x,
                              target.center_y, target.area_px);
                 }
             }
@@ -388,12 +419,13 @@ static void usb_library_task(void *argument)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "standalone white-ball camera starting");
+    ESP_LOGI(TAG, "white-ball straight transport starting");
     ESP_ERROR_CHECK(white_ball_display_init());
     if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0U) {
         ESP_LOGE(TAG, "PSRAM unavailable");
         return;
     }
+    ESP_ERROR_CHECK(ball_transport_controller_start());
     ESP_ERROR_CHECK(camera_stream_server_init());
     s_frame_queue = xQueueCreate(1U, sizeof(uvc_host_frame_t *));
     assert(s_frame_queue != NULL);
@@ -419,4 +451,3 @@ void app_main(void)
     ESP_ERROR_CHECK(uvc_host_install(&driver_config));
     ESP_LOGI(TAG, "waiting for UVC camera on GPIO19/20");
 }
-
