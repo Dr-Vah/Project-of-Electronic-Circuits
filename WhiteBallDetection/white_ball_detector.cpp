@@ -6,6 +6,9 @@
 
 namespace {
 
+constexpr uint8_t kRequiredConfirmationFrames = 4U;
+constexpr uint8_t kMaximumBridgedMisses = 2U;
+
 struct pixel_info_t {
     uint8_t luma;
     uint8_t chroma;
@@ -27,6 +30,8 @@ struct surroundings_t {
     float luma_contrast;
     float chroma_contrast;
     float shadow_score;
+    float outer_luma;
+    float outer_chroma;
 };
 
 pixel_info_t decode_pixel(uint16_t pixel, bool byte_swapped)
@@ -202,6 +207,8 @@ surroundings_t measure_surroundings(
         .chroma_contrast = outer_chroma - inner_chroma,
         .shadow_score = clamp01(
             4.0f * static_cast<float>(shadow_count) / outer_count),
+        .outer_luma = outer_luma,
+        .outer_chroma = outer_chroma,
     };
 }
 
@@ -271,6 +278,7 @@ void evaluate_component(const white_ball_detector_t *detector,
 
     const float box_width = component.right - component.left + 1U;
     const float box_height = component.bottom - component.top + 1U;
+    const float diameter = 0.5f * (box_width + box_height);
     const float aspect = box_width < box_height ? box_width / box_height
                                                 : box_height / box_width;
     const float fill = component.area / (box_width * box_height);
@@ -279,11 +287,24 @@ void evaluate_component(const white_ball_detector_t *detector,
 
     const surroundings_t surroundings = measure_surroundings(
         detector, pixels, width, height, component);
-    if (surroundings.luma_contrast <
-        config.minimum_local_luma_contrast) return;
+    /* A white ball under the camera/vehicle shadow can be darker than the
+     * illuminated paper. In that case its neutral colour, closed circular
+     * component and circular edge are still reliable, so use contrast
+     * magnitude while requiring a rounder component for the dim branch. */
+    const bool dim_component = surroundings.luma_contrast < 0.0f;
+    const float contrast_magnitude = fabsf(surroundings.luma_contrast);
+    if (contrast_magnitude < config.minimum_local_luma_contrast) return;
+    if (dim_component &&
+        (aspect < 0.75f || fill < 0.50f || fill > 0.90f ||
+         diameter < 6.0f || diameter > 32.0f ||
+         surroundings.outer_luma < 165.0f ||
+         surroundings.outer_chroma > 48.0f)) {
+        return;
+    }
     const float edge = circular_edge_score(
         detector, pixels, width, height, component);
-    if (edge < config.minimum_circular_edge_score) return;
+    if (edge < config.minimum_circular_edge_score ||
+        (dim_component && edge < 0.35f)) return;
     const float size_score = clamp01(
         (component.area - config.minimum_area_px + 1.0f) /
         (config.minimum_area_px * 5.0f));
@@ -291,13 +312,14 @@ void evaluate_component(const white_ball_detector_t *detector,
         0.55f * aspect + 0.45f *
         (1.0f - fabsf(fill - 0.78f) / 0.78f));
     const float brightness_score = clamp01(
-        surroundings.luma_contrast /
+        contrast_magnitude /
         (2.0f * config.minimum_local_luma_contrast));
     const float confidence = clamp01(
         0.10f * size_score + 0.25f * roundness +
         0.30f * brightness_score + 0.25f * edge +
         0.10f * surroundings.shadow_score);
     if (confidence < config.minimum_confidence ||
+        (dim_component && confidence < 0.65f) ||
         (best->valid && confidence <= best->confidence)) return;
 
     const float center_x = static_cast<float>(component.sum_x) / component.area;
@@ -316,7 +338,7 @@ void evaluate_component(const white_ball_detector_t *detector,
                         ? 0.0f
                         : 2.0f * center_x / (width - 1U) - 1.0f,
         .center_y = height <= 1U ? 0.0f : center_y / (height - 1U),
-        .diameter_px = 0.5f * (box_width + box_height),
+        .diameter_px = diameter,
         .luma_contrast = surroundings.luma_contrast,
         .chroma_contrast = surroundings.chroma_contrast,
         .circular_edge_score = edge,
@@ -355,17 +377,25 @@ void apply_temporal_confirmation(white_ball_detector_t *detector,
         detector->previous_candidate = candidate;
         *result = candidate;
         result->confirmation_count = detector->confirmation_count;
-        result->valid = detector->confirmation_count >= 3U;
+        result->valid = detector->confirmation_count >=
+                        kRequiredConfirmationFrames;
         return;
     }
 
-    if (detector->confirmation_count >= 3U &&
-        detector->missed_frames < 1U &&
+    /* JPEG noise and moving shadows often make a valid ball disappear for a
+     * frame. Bridge up to two misses both while acquiring and after lock, so
+     * an alternating hit/miss sequence can still become stable. */
+    if (detector->confirmation_count > 0U &&
+        detector->missed_frames < kMaximumBridgedMisses &&
         detector->previous_candidate.valid) {
         ++detector->missed_frames;
-        *result = detector->previous_candidate;
-        result->confirmation_count = detector->confirmation_count;
-        result->confidence *= 0.75f;
+        if (detector->confirmation_count >= kRequiredConfirmationFrames) {
+            *result = detector->previous_candidate;
+            result->confirmation_count = detector->confirmation_count;
+            result->valid = true;
+            result->confidence *=
+                detector->missed_frames == 1U ? 0.80f : 0.64f;
+        }
         return;
     }
     detector->confirmation_count = 0U;
@@ -387,16 +417,16 @@ extern "C" void white_ball_default_config(white_ball_config_t *config)
          * paper luma 177-192. The ball is slightly blue, so colour purity is
          * only used to reject strongly coloured objects such as the LED. */
         .minimum_luma = 210U,
-        .minimum_dim_luma = 120U,
+        .minimum_dim_luma = 100U,
         .local_highlight_difference = 6U,
         .maximum_luma = 255U,
         .maximum_chroma = 64U,
         .minimum_local_luma_contrast = 6U,
         .shadow_luma_difference = 16U,
-        .minimum_aspect_ratio = 0.35f,
-        .minimum_fill_ratio = 0.30f,
-        .minimum_circular_edge_score = 0.12f,
-        .minimum_confidence = 0.50f,
+        .minimum_aspect_ratio = 0.45f,
+        .minimum_fill_ratio = 0.35f,
+        .minimum_circular_edge_score = 0.16f,
+        .minimum_confidence = 0.52f,
         /* After the installed camera's 180-degree correction the course
          * surface occupies the lower part of the frame. Ignore room clutter. */
         .roi_top_fraction = 0.25f,
@@ -448,8 +478,17 @@ extern "C" bool white_ball_detect_rgb565(
                 pixel.luma >= detector->config.minimum_luma;
             const bool shadow_highlight = is_local_highlight(
                 detector, pixels, width, height, x, y, pixel);
+            /* In the supplied post-patrol view the ball is inside a broad
+             * shadow: its luma is about 115..170 while the paper is 180..200.
+             * Keep that neutral mid-tone island as a candidate. The 35-level
+             * gap below minimum_luma prevents it joining the paper mask. */
+            const bool dim_neutral_ball =
+                pixel.luma >= detector->config.minimum_dim_luma &&
+                (uint16_t)pixel.luma + 35U <=
+                    detector->config.minimum_luma &&
+                pixel.chroma <= detector->config.maximum_chroma;
             detector->mask[index] = static_cast<uint8_t>(
-                (directly_lit || shadow_highlight) &&
+                (directly_lit || shadow_highlight || dim_neutral_ball) &&
                 pixel.luma <= detector->config.maximum_luma &&
                 pixel.chroma <= detector->config.maximum_chroma);
         }
@@ -519,4 +558,3 @@ extern "C" bool white_ball_detect_rgb565(
     apply_temporal_confirmation(detector, candidate, result);
     return true;
 }
-

@@ -16,12 +16,13 @@ esp_err_t camera_stream_server_init(void);
 /* Copies one complete JPEG image. Safe to call from the frame task. */
 void camera_stream_server_publish_jpeg(const uint8_t *jpeg, size_t length);
 
-/* Publishes a normalised box in the orientation of the returned JPEG. */
-void camera_stream_server_publish_detection(bool valid, float left, float top,
-                                            float right, float bottom,
-                                            float confidence);
+/* Publishes normalised boxes in the orientation of the returned raw JPEG. */
+void camera_stream_server_publish_detection(
+    bool ball_valid, float ball_left, float ball_top,
+    float ball_right, float ball_bottom, float ball_confidence,
+    bool target_valid, float target_left, float target_top,
+    float target_right, float target_bottom);
 
 #ifdef __cplusplus
 }
 #endif
-

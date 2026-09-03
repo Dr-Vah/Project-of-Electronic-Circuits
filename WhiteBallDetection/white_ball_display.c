@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "chassis_camera_geometry.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
@@ -27,6 +28,9 @@
 #define COLOR_BOOT 0x001FU
 #define COLOR_GREEN 0x07E0U
 #define COLOR_CYAN 0x07FFU
+#define COLOR_MAGENTA 0xF81FU
+#define COLOR_YELLOW 0xFFE0U
+#define COLOR_RED 0xF800U
 
 static const char *TAG = "white_ball_display";
 static spi_device_handle_t s_display;
@@ -228,7 +232,8 @@ esp_err_t white_ball_display_init(void)
 
 esp_err_t white_ball_display_show_rgb565(
     const uint16_t *pixels, size_t width, size_t height,
-    bool rgb565_byte_swapped, const white_ball_result_t *ball)
+    bool rgb565_byte_swapped, const white_ball_result_t *ball,
+    const black_target_result_t *target)
 {
     if (pixels == NULL || width == 0U || height == 0U) {
         return ESP_ERR_INVALID_ARG;
@@ -239,6 +244,15 @@ esp_err_t white_ball_display_show_rgb565(
     if (render_height == 0U) render_height = 1U;
     if (render_height > TFT_HEIGHT) render_height = TFT_HEIGHT;
     const size_t y0 = (TFT_HEIGHT - render_height) / 2U;
+    const size_t chassis_left =
+        (size_t)(CHASSIS_CORRECTED_CENTER_LEFT_FRACTION *
+                 (TFT_WIDTH - 1U));
+    const size_t push_axis =
+        (size_t)(CHASSIS_CORRECTED_PUSH_AXIS_FRACTION *
+                 (TFT_WIDTH - 1U));
+    const size_t chassis_right =
+        (size_t)(CHASSIS_CORRECTED_CENTER_RIGHT_FRACTION *
+                 (TFT_WIDTH - 1U));
 
     bool draw_ball = ball != NULL && ball->valid;
     size_t box_left = 0U, box_right = 0U, box_top = 0U, box_bottom = 0U;
@@ -256,6 +270,22 @@ esp_err_t white_ball_display_show_rgb565(
         centre_y = (box_top + box_bottom) / 2U;
     }
 
+    const bool draw_target = target != NULL && target->valid;
+    size_t target_left = 0U, target_right = 0U;
+    size_t target_top = 0U, target_bottom = 0U;
+    if (draw_target) {
+        target_left = target->left * TFT_WIDTH / width;
+        target_right = (target->right + 1U) * TFT_WIDTH / width;
+        if (target_right > 0U) --target_right;
+        if (target_right >= TFT_WIDTH) target_right = TFT_WIDTH - 1U;
+        target_top = y0 + target->top * render_height / height;
+        target_bottom = y0 + (target->bottom + 1U) * render_height / height;
+        if (target_bottom > y0) --target_bottom;
+        if (target_bottom >= y0 + render_height) {
+            target_bottom = y0 + render_height - 1U;
+        }
+    }
+
     ESP_RETURN_ON_ERROR(
         set_window(0U, (uint16_t)y0, TFT_WIDTH - 1U,
                    (uint16_t)(y0 + render_height - 1U)),
@@ -268,6 +298,12 @@ esp_err_t white_ball_display_show_rgb565(
             uint16_t color = pixels[source_y * width + source_x];
             if (rgb565_byte_swapped) {
                 color = (uint16_t)((color << 8) | (color >> 8));
+            }
+            if (output_x == chassis_left || output_x == chassis_right) {
+                color = COLOR_YELLOW;
+            }
+            if (output_x == push_axis || output_x == push_axis + 1U) {
+                color = COLOR_RED;
             }
             if (draw_ball) {
                 const bool on_box =
@@ -283,6 +319,16 @@ esp_err_t white_ball_display_show_rgb565(
                 if (on_box) color = COLOR_GREEN;
                 if (on_cross) color = COLOR_CYAN;
             }
+            if (draw_target) {
+                const bool on_target_box =
+                    output_x >= target_left && output_x <= target_right &&
+                    screen_y >= target_top && screen_y <= target_bottom &&
+                    (output_x <= target_left + 1U ||
+                     output_x + 1U >= target_right ||
+                     screen_y <= target_top + 1U ||
+                     screen_y + 1U >= target_bottom);
+                if (on_target_box) color = COLOR_MAGENTA;
+            }
             put_color(output_x, color);
         }
         ESP_RETURN_ON_ERROR(write_bytes(true, s_line, sizeof(s_line)), TAG,
@@ -290,4 +336,3 @@ esp_err_t white_ball_display_show_rgb565(
     }
     return ESP_OK;
 }
-

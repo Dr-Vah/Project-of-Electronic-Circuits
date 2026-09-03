@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "chassis_camera_geometry.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
@@ -35,6 +36,11 @@ static float s_detection_top;
 static float s_detection_right;
 static float s_detection_bottom;
 static float s_detection_confidence;
+static bool s_target_valid;
+static float s_target_left;
+static float s_target_top;
+static float s_target_right;
+static float s_target_bottom;
 
 static const char s_index_html[] =
     "<!doctype html><html lang=zh-CN><head><meta charset=utf-8>"
@@ -43,20 +49,33 @@ static const char s_index_html[] =
     "body{margin:0;background:#101318;color:#eef;font:16px system-ui;text-align:center}"
     "main{max-width:900px;margin:auto;padding:18px}h1{font-size:22px}"
     "#v{position:relative;width:100%}img{display:block;width:100%;height:auto;"
-    "background:#000;border-radius:8px}#box{display:none;position:absolute;"
-    "box-sizing:border-box;border:3px solid #00ff55;border-radius:4px;"
-    "box-shadow:0 0 5px #000}"
+    "background:#000;border-radius:8px}.box{display:none;position:absolute;"
+    "box-sizing:border-box;border-radius:4px;box-shadow:0 0 5px #000;"
+    "pointer-events:none}#ball{border:3px solid #00ff55}"
+    "#target{border:3px solid #ff2bd6}.guide{position:absolute;top:0;bottom:0;"
+    "width:2px;pointer-events:none}.side{background:#ffe600}.axis{background:#f22;"
+    "width:3px}"
     "#s{color:#9bd;margin:10px}</style></head><body><main>"
     "<h1>ESP32 摄像头实时回传</h1><div id=s>等待视频帧…</div>"
-    "<div id=v><img id=cam src=/stream alt='camera stream'><div id=box></div></div>"
-    "<script>setInterval(async()=>{try{let r=await fetch('/status',{cache:'no-store'});"
-    "let j=await r.json(),b=document.querySelector('#box');"
-    "document.querySelector('#s').textContent=`已接收 ${j.frames} 帧 · JPEG ${j.bytes} 字节"
-    " · ${j.detected?'检测到白球':'未检测到白球'}`;"
-    "if(j.detected){b.style.display='block';b.style.left=(100*j.left)+'%';"
-    "b.style.top=(100*j.top)+'%';b.style.width=(100*(j.right-j.left))+'%';"
-    "b.style.height=(100*(j.bottom-j.top))+'%'}else b.style.display='none'"
-    "}catch(e){}},200)</script>"
+    "<div id=v><img id=cam src=/stream alt='camera stream'>"
+    "<div id=gleft class='guide side'></div><div id=axis class='guide axis'></div>"
+    "<div id=gright class='guide side'></div><div id=ball class=box></div>"
+    "<div id=target class=box></div></div>"
+    "<script>function box(e,on,l,t,r,b){if(!on){e.style.display='none';return;}"
+    "e.style.display='block';e.style.left=(100*l)+'%';e.style.top=(100*t)+'%';"
+    "e.style.width=(100*(r-l))+'%';e.style.height=(100*(b-t))+'%';}"
+    "function poll(){var x=new XMLHttpRequest();x.onreadystatechange=function(){"
+    "if(x.readyState!==4||x.status!==200)return;try{var j=JSON.parse(x.responseText);"
+    "document.getElementById('s').textContent='已接收 '+j.frames+' 帧 · JPEG '+"
+    "j.bytes+' 字节 · '+(j.detected?'检测到白球':'未检测到白球')+' · '+"
+    "(j.targetDetected?'检测到停止区':'未检测到停止区');"
+    "document.getElementById('gleft').style.left=(100*j.guideLeft)+'%';"
+    "document.getElementById('axis').style.left=(100*j.pushAxis)+'%';"
+    "document.getElementById('gright').style.left=(100*j.guideRight)+'%';"
+    "box(document.getElementById('ball'),j.detected,j.left,j.top,j.right,j.bottom);"
+    "box(document.getElementById('target'),j.targetDetected,j.targetLeft,j.targetTop,"
+    "j.targetRight,j.targetBottom);}catch(e){}};x.open('GET','/status?t='+Date.now(),true);"
+    "x.send();}setInterval(poll,200);poll();</script>"
     "</main></body></html>";
 
 static esp_err_t index_handler(httpd_req_t *request)
@@ -76,6 +95,11 @@ static esp_err_t status_handler(httpd_req_t *request)
     float right;
     float bottom;
     float confidence;
+    bool target_detected;
+    float target_left;
+    float target_top;
+    float target_right;
+    float target_bottom;
     xSemaphoreTake(s_frame_mutex, portMAX_DELAY);
     sequence = s_frame_sequence;
     length = s_latest_length;
@@ -85,15 +109,28 @@ static esp_err_t status_handler(httpd_req_t *request)
     right = s_detection_right;
     bottom = s_detection_bottom;
     confidence = s_detection_confidence;
+    target_detected = s_target_valid;
+    target_left = s_target_left;
+    target_top = s_target_top;
+    target_right = s_target_right;
+    target_bottom = s_target_bottom;
     xSemaphoreGive(s_frame_mutex);
 
-    char json[192];
+    char json[384];
     const int written = snprintf(json, sizeof(json),
         "{\"frames\":%" PRIu32 ",\"bytes\":%u,\"detected\":%s,"
         "\"left\":%.4f,\"top\":%.4f,\"right\":%.4f,"
-        "\"bottom\":%.4f,\"confidence\":%.3f}",
+        "\"bottom\":%.4f,\"confidence\":%.3f,"
+        "\"targetDetected\":%s,\"targetLeft\":%.4f,"
+        "\"targetTop\":%.4f,\"targetRight\":%.4f,"
+        "\"targetBottom\":%.4f,\"guideLeft\":%.3f,"
+        "\"pushAxis\":%.3f,\"guideRight\":%.3f}",
         sequence, (unsigned)length, detected ? "true" : "false",
-        left, top, right, bottom, confidence);
+        left, top, right, bottom, confidence,
+        target_detected ? "true" : "false", target_left, target_top,
+        target_right, target_bottom, CHASSIS_RAW_CENTER_LEFT_FRACTION,
+        CHASSIS_RAW_PUSH_AXIS_FRACTION,
+        CHASSIS_RAW_CENTER_RIGHT_FRACTION);
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     return httpd_resp_send(request, json, written);
@@ -264,18 +301,24 @@ void camera_stream_server_publish_jpeg(const uint8_t *jpeg, size_t length)
     xSemaphoreGive(s_frame_mutex);
 }
 
-void camera_stream_server_publish_detection(bool valid, float left, float top,
-                                            float right, float bottom,
-                                            float confidence)
+void camera_stream_server_publish_detection(
+    bool ball_valid, float ball_left, float ball_top,
+    float ball_right, float ball_bottom, float ball_confidence,
+    bool target_valid, float target_left, float target_top,
+    float target_right, float target_bottom)
 {
     if (s_frame_mutex == NULL) return;
     xSemaphoreTake(s_frame_mutex, portMAX_DELAY);
-    s_detection_valid = valid;
-    s_detection_left = left;
-    s_detection_top = top;
-    s_detection_right = right;
-    s_detection_bottom = bottom;
-    s_detection_confidence = confidence;
+    s_detection_valid = ball_valid;
+    s_detection_left = ball_left;
+    s_detection_top = ball_top;
+    s_detection_right = ball_right;
+    s_detection_bottom = ball_bottom;
+    s_detection_confidence = ball_confidence;
+    s_target_valid = target_valid;
+    s_target_left = target_left;
+    s_target_top = target_top;
+    s_target_right = target_right;
+    s_target_bottom = target_bottom;
     xSemaphoreGive(s_frame_mutex);
 }
-
