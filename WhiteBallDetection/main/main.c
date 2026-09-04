@@ -18,12 +18,12 @@
 #include "usb/usb_host.h"
 #include "usb/uvc_host.h"
 
-#include "camera_stream_server.h"
 #include "black_target_detector.h"
 #include "ball_transport_controller.h"
+#include "camera_display.h"
 #include "orange_ball_detector.h"
 #include "white_ball_detector.h"
-#include "white_ball_display.h"
+#include "wifi_stream.h"
 
 #define USB_TASK_PRIORITY 15
 #define FRAME_BUFFER_COUNT 4
@@ -40,6 +40,82 @@ static volatile bool s_device_connected;
 static bool s_stream_task_started;
 static uvc_host_stream_hdl_t s_stream;
 static uvc_host_stream_config_t s_stream_config;
+
+static uint16_t rgb565_to_wire(uint16_t rgb565)
+{
+    return (uint16_t)((rgb565 << 8) | (rgb565 >> 8));
+}
+
+static void set_wire_pixel(uint16_t *pixels, unsigned width, unsigned height,
+                           unsigned x, unsigned y, uint16_t rgb565)
+{
+    if (x < width && y < height) {
+        pixels[(size_t)y * width + x] = rgb565_to_wire(rgb565);
+    }
+}
+
+static void draw_ball_circle(uint16_t *pixels, unsigned width, unsigned height,
+                             const ball_detection_t *circle)
+{
+    /* Green circle and red centre; framebuffer is already byte-swapped for SPI. */
+    const int r = circle->radius;
+    for (int thickness = -1; thickness <= 1; ++thickness) {
+        const int draw_r = r + thickness;
+        if (draw_r < 1) continue;
+        for (int degree = 0; degree < 360; degree += 4) {
+            const float a = degree * 0.0174532925f;
+            const int x = (int)lroundf(circle->x + draw_r * cosf(a));
+            const int y = (int)lroundf(circle->y + draw_r * sinf(a));
+            set_wire_pixel(pixels, width, height, x, y, 0x07E0);
+        }
+    }
+    for (int y = -2; y <= 2; ++y)
+        for (int x = -2; x <= 2; ++x)
+            set_wire_pixel(pixels, width, height, circle->x + x, circle->y + y, 0xF800);
+}
+
+static void downscale_for_display(const uint16_t *source, unsigned source_width,
+                                  unsigned source_height, uint16_t *display,
+                                  unsigned *display_width, unsigned *display_height)
+{
+    unsigned out_width, out_height;
+    if ((uint64_t)source_width * CAMERA_DISPLAY_HEIGHT >
+        (uint64_t)source_height * CAMERA_DISPLAY_WIDTH) {
+        out_width = CAMERA_DISPLAY_WIDTH;
+        out_height = source_height * out_width / source_width;
+    } else {
+        out_height = CAMERA_DISPLAY_HEIGHT;
+        out_width = source_width * out_height / source_height;
+    }
+    if (out_width == 0) out_width = 1;
+    if (out_height == 0) out_height = 1;
+    for (unsigned y = 0; y < out_height; ++y) {
+        const unsigned sy = y * source_height / out_height;
+        for (unsigned x = 0; x < out_width; ++x) {
+            const unsigned sx = x * source_width / out_width;
+            display[(size_t)y * out_width + x] =
+                source[(size_t)sy * source_width + sx];
+        }
+    }
+    *display_width = out_width;
+    *display_height = out_height;
+}
+
+static ball_detection_t ball_result_to_detection(
+    const white_ball_result_t *ball)
+{
+    ball_detection_t detection = {0};
+    if (ball == NULL || !ball->valid) return detection;
+    detection.x = (uint16_t)(((uint32_t)ball->left + ball->right) / 2U);
+    detection.y = (uint16_t)(((uint32_t)ball->top + ball->bottom) / 2U);
+    detection.radius = (uint16_t)lroundf(ball->diameter_px * 0.5f);
+    if (detection.radius == 0U) detection.radius = 1U;
+    float coverage = ball->circular_edge_score * 32.0f;
+    if (coverage < 0.0f) coverage = 0.0f;
+    if (coverage > 32.0f) coverage = 32.0f;
+    detection.coverage = (uint8_t)lroundf(coverage);
+    return detection;
+}
 
 static float interval_to_fps(uint32_t interval)
 {
@@ -133,6 +209,9 @@ static void frame_processing_task(void *argument)
     uint16_t *framebuffer = heap_caps_malloc(
         RGB_FRAME_PIXELS * sizeof(uint16_t),
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint16_t *displaybuffer = heap_caps_malloc(
+        CAMERA_DISPLAY_WIDTH * CAMERA_DISPLAY_HEIGHT * sizeof(uint16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     uint8_t *jpeg_work = heap_caps_malloc(
         JPEG_WORK_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     white_ball_detector_t *detector = heap_caps_calloc(
@@ -141,7 +220,8 @@ static void frame_processing_task(void *argument)
         1U, sizeof(*orange_detector), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     black_target_detector_t *target_detectors = heap_caps_calloc(
         2U, sizeof(*target_detectors), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(framebuffer != NULL && jpeg_work != NULL && detector != NULL &&
+    assert(framebuffer != NULL && displaybuffer != NULL &&
+           jpeg_work != NULL && detector != NULL &&
            orange_detector != NULL && target_detectors != NULL);
 
     white_ball_config_t detector_config;
@@ -169,7 +249,9 @@ static void frame_processing_task(void *argument)
             continue;
         }
 
-        camera_stream_server_publish_jpeg(frame->data, frame->data_len);
+        wifi_stream_publish_jpeg(frame->data, frame->data_len,
+                                 frame->vs_format.h_res,
+                                 frame->vs_format.v_res);
 
         esp_jpeg_image_cfg_t jpeg_config = {
             .indata = frame->data,
@@ -216,6 +298,25 @@ static void frame_processing_task(void *argument)
                     orange_detector, framebuffer, output.width, output.height,
                     &balls[BALL_COLOR_ORANGE]);
             }
+
+            /* BallDet's browser shows the unrotated JPEG, so publish the
+             * active detection before rotating the controller framebuffer. */
+            ball_detection_t stream_ball = {0};
+            const bool stream_ball_valid =
+                detection_ok[active_color] && balls[active_color].valid;
+            if (stream_ball_valid) {
+                stream_ball = ball_result_to_detection(&balls[active_color]);
+                if (active_color == BALL_COLOR_WHITE &&
+                    detector->have_search_hint) {
+                    stream_ball.score = detector->search_hint.score;
+                    stream_ball.coverage = detector->search_hint.coverage;
+                }
+            }
+            wifi_stream_publish_detection(
+                stream_ball_valid,
+                stream_ball_valid ? &stream_ball : NULL,
+                output.width, output.height);
+
             rotate_frame_180(framebuffer, output.width, output.height);
             rotate_ball_result_180(&balls[BALL_COLOR_WHITE],
                                    output.width, output.height);
@@ -268,40 +369,6 @@ static void frame_processing_task(void *argument)
                 ball_transport_controller_submit(
                     &ball, &target, active_color, output.width, output.height,
                     frame_time_us);
-                /* Detection runs after a 180-degree rotation, while the
-                 * browser receives the original JPEG. Convert both boxes
-                 * back to the browser orientation and publish atomically. */
-                float ball_left = 0.0f, ball_top = 0.0f;
-                float ball_right = 0.0f, ball_bottom = 0.0f;
-                float target_left = 0.0f, target_top = 0.0f;
-                float target_right = 0.0f, target_bottom = 0.0f;
-                if (ball.valid) {
-                    ball_left =
-                        1.0f - (float)(ball.right + 1U) / output.width;
-                    ball_top =
-                        1.0f - (float)(ball.bottom + 1U) / output.height;
-                    ball_right = 1.0f - (float)ball.left / output.width;
-                    ball_bottom = 1.0f - (float)ball.top / output.height;
-                }
-                if (target.valid) {
-                    target_left =
-                        1.0f - (float)(target.right + 1U) / output.width;
-                    target_top =
-                        1.0f - (float)(target.bottom + 1U) / output.height;
-                    target_right =
-                        1.0f - (float)target.left / output.width;
-                    target_bottom =
-                        1.0f - (float)target.top / output.height;
-                }
-                camera_stream_server_publish_detection(
-                    ball.valid, ball_left, ball_top, ball_right, ball_bottom,
-                    ball.confidence, target.valid, target_left, target_top,
-                    target_right, target_bottom);
-                ESP_ERROR_CHECK_WITHOUT_ABORT(
-                    white_ball_display_show_rgb565(
-                        framebuffer, output.width, output.height,
-                        detector_config.rgb565_byte_swapped, &ball,
-                        &target));
                 const int64_t now_us = frame_time_us;
                 if (now_us >= next_log_us) {
                     next_log_us = now_us + 1500000LL;
@@ -323,10 +390,31 @@ static void frame_processing_task(void *argument)
                              target.center_y, target.area_px);
                 }
             }
+
+            unsigned display_width = 0U, display_height = 0U;
+            downscale_for_display(framebuffer, output.width, output.height,
+                                  displaybuffer, &display_width,
+                                  &display_height);
+            if (ball_detection_ok && ball.valid) {
+                ball_detection_t screen_ball =
+                    ball_result_to_detection(&ball);
+                screen_ball.x = (uint16_t)(
+                    (uint32_t)screen_ball.x * display_width / output.width);
+                screen_ball.y = (uint16_t)(
+                    (uint32_t)screen_ball.y * display_height / output.height);
+                screen_ball.radius = (uint16_t)(
+                    (uint32_t)screen_ball.radius * display_width /
+                    output.width);
+                if (screen_ball.radius < 2U) screen_ball.radius = 2U;
+                draw_ball_circle(displaybuffer, display_width,
+                                 display_height, &screen_ball);
+            }
+            ESP_ERROR_CHECK_WITHOUT_ABORT(camera_display_draw_rgb565(
+                displaybuffer, display_width, display_height));
         } else {
-            camera_stream_server_publish_detection(
-                false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                false, 0.0f, 0.0f, 0.0f, 0.0f);
+            wifi_stream_publish_detection(false, NULL,
+                                           frame->vs_format.h_res,
+                                           frame->vs_format.v_res);
             ESP_LOGW(TAG, "JPEG decode failed: %s, output=%ux%u",
                      esp_err_to_name(decode_result), output.width,
                      output.height);
@@ -488,13 +576,13 @@ static void usb_library_task(void *argument)
 void app_main(void)
 {
     ESP_LOGI(TAG, "two-ball transport starting (white, then orange)");
-    ESP_ERROR_CHECK(white_ball_display_init());
+    ESP_ERROR_CHECK(camera_display_init());
     if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0U) {
         ESP_LOGE(TAG, "PSRAM unavailable");
         return;
     }
     ESP_ERROR_CHECK(ball_transport_controller_start());
-    ESP_ERROR_CHECK(camera_stream_server_init());
+    ESP_ERROR_CHECK(wifi_stream_start());
     s_frame_queue = xQueueCreate(1U, sizeof(uvc_host_frame_t *));
     assert(s_frame_queue != NULL);
     assert(xTaskCreatePinnedToCore(frame_processing_task, "white_ball", 6144,

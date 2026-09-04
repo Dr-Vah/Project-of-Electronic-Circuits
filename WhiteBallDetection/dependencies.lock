@@ -44,4 +44,3 @@ direct_dependencies:
 manifest_hash: 17693964fb65ba89a2a84025c49c2be7aaf968a602b7594ac4311a660b753d06
 target: esp32s3
 version: 2.0.0
-

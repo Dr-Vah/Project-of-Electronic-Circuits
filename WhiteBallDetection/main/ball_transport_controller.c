@@ -18,18 +18,22 @@
 #define REQUIRED_STABLE_FRAMES 2U
 #define LOST_VISION_LIMIT 5U
 
-#define STAGING_STRAFE_GAIN 0.045f
 /* BallDet is more selective but takes longer per frame. Keep chassis motion
  * conservative so one detection interval cannot create a large overshoot. */
 #define ALIGN_TURN_GAIN 0.30f
-#define MAX_STAGING_STRAFE_MPS 0.020f
+/* Lateral wheel speeds are {0.5, 1.0, 0.5} times the chassis command. A
+ * 0.060 m/s chassis kick gives the two half-speed wheels 0.030 m/s, matching
+ * the already proven approach speed closely enough to overcome stiction.
+ * Bound displacement by pulse time instead of lowering the wheel torque. */
+#define STAGING_STRAFE_KICK_MPS 0.060f
+#define STAGING_STRAFE_PULSE_MS 100
 #define NEAR_LINE_TURN_PULSE_RAD_S 0.35f
 #define NEAR_LINE_TURN_PULSE_MS 55
 #define LINE_BOTTOM_TOLERANCE 0.055f
 #define LINE_BOTTOM_RECHECK_TOLERANCE 0.10f
 #define APPROACH_SPEED_MPS 0.030f
-#define PUSH_SPEED_MPS 0.040f
-#define NEAR_TARGET_PUSH_SPEED_MPS 0.022f
+#define PUSH_SPEED_MPS 0.045f
+#define NEAR_TARGET_PUSH_SPEED_MPS 0.025f
 #define BACK_AWAY_SPEED_MPS 0.030f
 /* Keep rotation below the amount that can move a locked ball/target outside
  * its local tracking window between two camera results. */
@@ -92,6 +96,8 @@ typedef struct {
     int64_t blind_capture_deadline_us;
     int64_t approach_dropout_deadline_us;
     int64_t turn_pulse_deadline_us;
+    int64_t strafe_pulse_deadline_us;
+    float last_visible_target_bottom;
     ball_color_t active_color;
 } transport_context_t;
 
@@ -144,6 +150,7 @@ static void enter_state(transport_context_t *context,
     context->blind_capture_deadline_us = 0;
     context->approach_dropout_deadline_us = 0;
     context->turn_pulse_deadline_us = 0;
+    context->strafe_pulse_deadline_us = 0;
 }
 
 static bool copy_latest_vision(transport_vision_t *vision)
@@ -219,6 +226,10 @@ static void update_on_new_frame(transport_context_t *context,
                                 const transport_vision_t *vision,
                                 int64_t now_us)
 {
+    if (vision->target.valid && vision->height > 0U) {
+        context->last_visible_target_bottom =
+            (float)(vision->target.bottom + 1U) / (float)vision->height;
+    }
     const float separation =
         vision->target.center_x - vision->ball.center_x;
     const float target_axis_error =
@@ -291,6 +302,7 @@ static void update_on_new_frame(transport_context_t *context,
             /* Phase 1: the chassis centre, ball and target are collinear.
              * Confirm while stopped, then proceed to rotation-only phase 2. */
             stop_motors();
+            context->strafe_pulse_deadline_us = 0;
             if (++context->stable_frames >= REQUIRED_STABLE_FRAMES) {
                 enter_state(context, TRANSPORT_ALIGN_APPROACH);
             }
@@ -298,11 +310,16 @@ static void update_on_new_frame(transport_context_t *context,
         }
         context->stable_frames = 0U;
         /* Translation phase: no forward motion and no rotation. Moving the
-         * chassis right makes a right-side floor line move left in the image. */
-        apply_velocity(
-            clampf(STAGING_STRAFE_GAIN * line_bottom_error,
-                   -MAX_STAGING_STRAFE_MPS, MAX_STAGING_STRAFE_MPS),
-            0.0f, 0.0f);
+         * chassis right makes a right-side floor line move left in the image.
+         * Use a bounded pulse, then wait stopped for the next vision result;
+         * otherwise a slow camera frame lets even a low speed overshoot. */
+        if (context->strafe_pulse_deadline_us == 0) {
+            context->strafe_pulse_deadline_us =
+                now_us + STAGING_STRAFE_PULSE_MS * 1000LL;
+        }
+        apply_velocity(copysignf(STAGING_STRAFE_KICK_MPS,
+                                 line_bottom_error),
+                       0.0f, 0.0f);
         break;
 
     case TRANSPORT_ALIGN_APPROACH:
@@ -430,14 +447,21 @@ static void update_on_new_frame(transport_context_t *context,
 
     case TRANSPORT_STRAIGHT_PUSH: {
         if (!vision->target.valid) {
-            /* Completion must be observed while the black patch is still
-             * visible at the bottom of the frame. Disappearance is not a
-             * success condition and must never trigger blind forward motion. */
-            stop_motors();
-            if (++context->lost_frames >= LOST_VISION_LIMIT) {
-                ESP_LOGE(TAG, "target lost before visible-bottom stop");
-                enter_state(context, TRANSPORT_FAULT);
+            /* Three-point alignment is the commitment point. A normal target
+             * segmentation dropout must not interrupt or steer the push.
+             * The global stale-frame and committed-drive timeouts still stop
+             * the chassis if the camera actually fails or no endpoint is
+             * observed within the bounded run. */
+            if (++context->lost_frames == 1U) {
+                ESP_LOGW(TAG,
+                         "target temporarily lost; continue committed push");
             }
+            apply_velocity(
+                0.0f,
+                context->last_visible_target_bottom >=
+                        TARGET_SLOWDOWN_BOTTOM_FRACTION
+                    ? NEAR_TARGET_PUSH_SPEED_MPS : PUSH_SPEED_MPS,
+                0.0f);
             break;
         }
         context->lost_frames = 0U;
@@ -449,8 +473,7 @@ static void update_on_new_frame(transport_context_t *context,
             enter_state(context, TRANSPORT_SETTLE);
             break;
         }
-        const float target_bottom =
-            (float)(vision->target.bottom + 1U) / (float)vision->height;
+        const float target_bottom = context->last_visible_target_bottom;
         if (target_bottom >= TARGET_VISIBLE_STOP_BOTTOM_FRACTION) {
             ESP_LOGI(TAG,
                      "target visible at frame bottom; stop push immediately");
@@ -508,6 +531,13 @@ static void controller_task(void *argument)
             now_us >= context.turn_pulse_deadline_us) {
             stop_motors();
             context.turn_pulse_deadline_us = 0;
+        }
+
+        if (context.state == TRANSPORT_STAGE_BEHIND_BALL &&
+            context.strafe_pulse_deadline_us != 0 &&
+            now_us >= context.strafe_pulse_deadline_us) {
+            stop_motors();
+            context.strafe_pulse_deadline_us = 0;
         }
 
         /* Complete the dropout hand-off from the fast control loop so a slow
