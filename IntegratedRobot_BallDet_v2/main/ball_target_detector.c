@@ -1,4 +1,5 @@
 #include "ball_target_detector.h"
+#include "chassis_camera_geometry.h"
 
 #include <limits.h>
 #include <math.h>
@@ -23,8 +24,18 @@
 #define BT_TARGET_REQUIRED_FRAMES 1
 #define BT_TARGET_MAX_CENTER_JUMP 120
 #define BT_DARK_THRESHOLD 110
-#define BT_TARGET_MAX_BOX_WIDTH 48
-#define BT_TARGET_MAX_BOX_HEIGHT 20
+/* Display is rotated 180 degrees: screen-left 30% is raw-right 30%. */
+#define BT_WHITE_SCREEN_LEFT_MASK_PERCENT 30
+#define BT_ORANGE_SCREEN_RIGHT_MASK_PERCENT 30
+/* Near targets grow in the image. Scale limits to the working resolution. */
+#define BT_TARGET_MAX_BOX_WIDTH_PERCENT 60
+#define BT_TARGET_MAX_BOX_HEIGHT_PERCENT 60
+#define BT_TARGET_RAW_ROI_TOP_PERCENT 5
+/* Screen ROI: centred on the push axis, width 30%, height 55%..70%. */
+#define BT_STOP_HALF_WIDTH_FRACTION 0.15f
+#define BT_STOP_SCREEN_TOP_PERCENT 55
+#define BT_STOP_SCREEN_BOTTOM_PERCENT 70
+#define BT_STOP_MIN_DARK_PERCENT 20
 
 static const char s_visualization_html[] =
     "<!doctype html><html><head><meta charset='utf-8'>"
@@ -225,6 +236,29 @@ static void bt_preprocess_release(bt_preprocessed_frame_t *frame)
     }
     free(frame->storage);
     memset(frame, 0, sizeof(*frame));
+}
+
+static uint8_t bt_black_ahead_percent(const bt_preprocessed_frame_t *frame,
+                                      bool mask_screen_right)
+{
+    const int width = frame->width, height = frame->height;
+    int x0 = bt_max(0, (int)(width *
+        (CHASSIS_RAW_PUSH_AXIS_FRACTION - BT_STOP_HALF_WIDTH_FRACTION)));
+    if (mask_screen_right) {
+        x0 = bt_max(x0, width * BT_ORANGE_SCREEN_RIGHT_MASK_PERCENT / 100);
+    }
+    const int x1 = bt_min(width, (int)(width *
+        (CHASSIS_RAW_PUSH_AXIS_FRACTION + BT_STOP_HALF_WIDTH_FRACTION)));
+    /* Undo the screen's 180-degree rotation to sample the raw near floor. */
+    const int y0 = height * (100 - BT_STOP_SCREEN_BOTTOM_PERCENT) / 100;
+    const int y1 = height * (100 - BT_STOP_SCREEN_TOP_PERCENT) / 100;
+    const int total = (x1 - x0) * (y1 - y0);
+    if (total <= 0) return 0;
+    unsigned dark = 0;
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x)
+            if (frame->gray[y * width + x] <= BT_DARK_THRESHOLD) ++dark;
+    return (uint8_t)(dark * 100U / (unsigned)total);
 }
 
 static esp_err_t bt_detect_white_ball(const bt_preprocessed_frame_t *frame,
@@ -645,6 +679,8 @@ static void bt_export_target(const bt_target_candidate_t *candidate,
 
 static esp_err_t bt_detect_black_targets(const bt_preprocessed_frame_t *frame,
                                          const bt_target_t *hint,
+                                         bool mask_screen_left,
+                                         bool mask_screen_right,
                                          bt_raw_target_result_t *result)
 {
     if (frame == NULL || frame->storage == NULL || result == NULL) {
@@ -654,9 +690,13 @@ static esp_err_t bt_detect_black_targets(const bt_preprocessed_frame_t *frame,
 
     const int width = frame->width;
     const int height = frame->height;
-    const int roi_x0 = width * 3 / 100;
-    const int roi_x1 = width * 97 / 100;
-    const int roi_y0 = height * 50 / 100;
+    const int roi_x0 = width * (mask_screen_right
+        ? BT_ORANGE_SCREEN_RIGHT_MASK_PERCENT : 3) / 100;
+    const int roi_x1 = width * (mask_screen_left
+        ? 100 - BT_WHITE_SCREEN_LEFT_MASK_PERCENT : 97) / 100;
+    /* Raw top becomes screen bottom after rotation. Include the near floor
+     * to keep enlarged targets visible during approach. */
+    const int roi_y0 = height * BT_TARGET_RAW_ROI_TOP_PERCENT / 100;
     const int roi_y1 = height * 94 / 100;
     const size_t pixel_count = (size_t)width * height;
     uint8_t *visited = bt_alloc(pixel_count, true,
@@ -732,8 +772,9 @@ static esp_err_t bt_detect_black_targets(const bt_preprocessed_frame_t *frame,
             const int box_height = maximum_y - minimum_y + 1;
             const int box_area = box_width * box_height;
             if (area < 8 || box_width < 5 || box_height < 2 ||
-                touches_bottom || box_width > BT_TARGET_MAX_BOX_WIDTH ||
-                box_height > BT_TARGET_MAX_BOX_HEIGHT ||
+                touches_bottom ||
+                box_width > width * BT_TARGET_MAX_BOX_WIDTH_PERCENT / 100 ||
+                box_height > height * BT_TARGET_MAX_BOX_HEIGHT_PERCENT / 100 ||
                 box_width > box_height * 9 || box_height > box_width * 2 ||
                 area * 5 < box_area) {
                 continue;
@@ -925,11 +966,13 @@ static bool bt_update_target_tracker(bt_detector_t *detector,
     (uint16_t)((3U * detector->target_candidate.FIELD + detected.FIELD) / 4U)
     BT_SMOOTH_TARGET(x);
     BT_SMOOTH_TARGET(y);
-    BT_SMOOTH_TARGET(x0);
-    BT_SMOOTH_TARGET(y0);
-    BT_SMOOTH_TARGET(x1);
-    BT_SMOOTH_TARGET(y1);
 #undef BT_SMOOTH_TARGET
+    /* Keep heading centres filtered, but do not delay stop/overlap geometry
+     * by averaging the box with earlier, more distant observations. */
+    detector->target_candidate.x0 = detected.x0;
+    detector->target_candidate.y0 = detected.y0;
+    detector->target_candidate.x1 = detected.x1;
+    detector->target_candidate.y1 = detected.y1;
     detector->target_candidate.area = detected.area;
     detector->target_candidate.score = detected.score;
     detector->target_candidate.mean_luminance = detected.mean_luminance;
@@ -962,11 +1005,25 @@ esp_err_t bt_detector_process_rgb565(bt_detector_t *detector,
     result->frame_width = width;
     result->frame_height = height;
 
+    if (detector->white_delivery_complete && !detector->orange_right_mask_active) {
+        detector->white_left_mask_active = false;
+        detector->orange_right_mask_active = true;
+        detector->target_has_candidate = false;
+        detector->target_valid = false;
+        detector->target_consecutive_frames = 0;
+    }
+
     bt_preprocessed_frame_t frame = {0};
     esp_err_t error = bt_preprocess_rgb565(pixels, width, height, &frame);
     if (error != ESP_OK) {
         return error;
     }
+
+    /* Compute before the expensive ball/target routines. A positive stop
+     * observation remains usable even if a later allocation fails. */
+    result->black_ahead_percent = bt_black_ahead_percent(
+        &frame, detector->orange_right_mask_active);
+    result->black_ahead = result->black_ahead_percent >= BT_STOP_MIN_DARK_PERCENT;
 
     bt_raw_ball_result_t raw_ball = {0};
     error = bt_detect_white_ball(
@@ -1010,58 +1067,66 @@ esp_err_t bt_detector_process_rgb565(bt_detector_t *detector,
 
     bt_raw_ball_result_t raw_orange = {0};
     bt_raw_target_result_t raw_targets = {0};
-    if (detector->ball_valid || detector->white_delivery_complete) {
-        error = bt_detect_black_targets(&frame,
+    /* A hidden/missed white ball must not disable endpoint detection. */
+    error = bt_detect_black_targets(&frame,
+        (detector->white_delivery_complete || detector->white_left_mask_active) &&
             detector->target_has_candidate ? &detector->target_candidate : NULL,
-            &raw_targets);
+        detector->white_left_mask_active, detector->orange_right_mask_active,
+        &raw_targets);
+    if (error != ESP_OK) {
+        bt_preprocess_release(&frame);
+        return error;
+    }
+    /* Keep the full ROI until two blocks are observed together. Latch the
+     * mask through misses and apply it immediately to this same frame. */
+    if (!detector->white_delivery_complete &&
+        !detector->white_left_mask_active && raw_targets.count == 2) {
+        detector->white_left_mask_active = true;
+        detector->target_has_candidate = false;
+        detector->target_valid = false;
+        detector->target_consecutive_frames = 0;
+        error = bt_detect_black_targets(&frame, NULL, true, false, &raw_targets);
         if (error != ESP_OK) {
             bt_preprocess_release(&frame);
             return error;
         }
-        error = bt_detect_orange_ball(&frame, &raw_orange);
-        if (error != ESP_OK) {
-            bt_preprocess_release(&frame);
-            return error;
-        }
+    }
+    error = bt_detect_orange_ball(&frame, &raw_orange);
+    if (error != ESP_OK) {
+        bt_preprocess_release(&frame);
+        return error;
+    }
 
-        if (raw_orange.found) {
-            detector->orange_misses = 0;
-            if (bt_update_orange_tracker(detector, &raw_orange,
-                                         &detector->stable_orange)) {
-                detector->orange_valid = true;
-            }
-        } else {
-            bt_update_orange_tracker(detector, &raw_orange, NULL);
-            if (detector->orange_misses < UINT8_MAX) {
-                ++detector->orange_misses;
-            }
-            if (detector->orange_misses >= 1) {
-                detector->orange_valid = false;
-            }
-        }
-
-        if (raw_targets.found) {
-            detector->target_misses = 0;
-            if (bt_update_target_tracker(detector, &raw_targets,
-                                         &detector->stable_target)) {
-                detector->target_valid = true;
-            }
-        } else {
-            bt_update_target_tracker(detector, &raw_targets, NULL);
-            if (detector->target_misses < UINT8_MAX) {
-                ++detector->target_misses;
-            }
-            if (detector->target_misses >= 1) {
-                detector->target_valid = false;
-            }
+    if (raw_orange.found) {
+        detector->orange_misses = 0;
+        if (bt_update_orange_tracker(detector, &raw_orange,
+                                     &detector->stable_orange)) {
+            detector->orange_valid = true;
         }
     } else {
         bt_update_orange_tracker(detector, &raw_orange, NULL);
-        bt_update_target_tracker(detector, &raw_targets, NULL);
-        detector->orange_valid = false;
-        detector->target_valid = false;
-        detector->orange_misses = 0;
+        if (detector->orange_misses < UINT8_MAX) {
+            ++detector->orange_misses;
+        }
+        if (detector->orange_misses >= 1) {
+            detector->orange_valid = false;
+        }
+    }
+
+    if (raw_targets.found) {
         detector->target_misses = 0;
+        if (bt_update_target_tracker(detector, &raw_targets,
+                                     &detector->stable_target)) {
+            detector->target_valid = true;
+        }
+    } else {
+        bt_update_target_tracker(detector, &raw_targets, NULL);
+        if (detector->target_misses < UINT8_MAX) {
+            ++detector->target_misses;
+        }
+        if (detector->target_misses >= 1) {
+            detector->target_valid = false;
+        }
     }
 
     result->ball_valid = detector->ball_valid;

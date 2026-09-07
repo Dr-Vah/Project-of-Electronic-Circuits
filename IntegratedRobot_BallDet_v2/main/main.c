@@ -61,6 +61,49 @@
 
 static const char *TAG = "LINE_TRACK";
 
+/* One task owns all ultrasonic triggers throughout both missions. The line
+ * controller consumes fresh snapshots; the display reuses the same samples. */
+static portMUX_TYPE s_telemetry_lock = portMUX_INITIALIZER_UNLOCKED;
+static ultrasonic_sample_t s_telemetry_sample;
+static bool s_telemetry_ready;
+
+static bool telemetry_copy_new_sample(ultrasonic_sample_t *sample)
+{
+    portENTER_CRITICAL(&s_telemetry_lock);
+    const bool fresh = s_telemetry_ready &&
+        s_telemetry_sample.timestamp_us != sample->timestamp_us;
+    if (fresh) *sample = s_telemetry_sample;
+    portEXIT_CRITICAL(&s_telemetry_lock);
+    return fresh;
+}
+
+static void robot_telemetry_task(void *argument)
+{
+    (void)argument;
+    int64_t next_display_us = 0;
+    while (true) {
+        ultrasonic_sample_t sample = {0};
+        const esp_err_t error = ultrasonic_sensor_read(&sample);
+        if (error != ESP_OK) {
+            sample.valid = false;
+            sample.timestamp_us = esp_timer_get_time();
+            ESP_LOGW(TAG, "telemetry ultrasonic read failed: %s", esp_err_to_name(error));
+        }
+        portENTER_CRITICAL(&s_telemetry_lock);
+        s_telemetry_sample = sample;
+        s_telemetry_ready = true;
+        portEXIT_CRITICAL(&s_telemetry_lock);
+
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_display_us) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(tft_display_update_from_modules(&sample));
+            next_display_us = now_us + TFT_UPDATE_PERIOD_MS * 1000LL;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ULTRASONIC_SAMPLE_PERIOD_MS));
+    }
+}
+
+
 typedef enum {
     TRACK_WAIT_START,
     TRACK_FORWARD,
@@ -563,8 +606,8 @@ static bool avoidance_update(avoidance_context_t *avoidance,
                              const infrared_data_t *ir, int64_t now_us)
 {
     if (avoidance->state == AVOID_IDLE) {
-        if (now_us >= avoidance->next_sample_us) {
-            ESP_ERROR_CHECK(ultrasonic_sensor_read(&avoidance->latest_sample));
+        if (now_us >= avoidance->next_sample_us &&
+            telemetry_copy_new_sample(&avoidance->latest_sample)) {
             avoidance->next_sample_us =
                 avoidance->latest_sample.timestamp_us +
                 ULTRASONIC_SAMPLE_PERIOD_MS * 1000LL;
@@ -595,8 +638,8 @@ static bool avoidance_update(avoidance_context_t *avoidance,
 
     switch (avoidance->state) {
     case AVOID_STRAFE_LEFT:
-        if (now_us >= avoidance->next_sample_us) {
-            ESP_ERROR_CHECK(ultrasonic_sensor_read(&avoidance->latest_sample));
+        if (now_us >= avoidance->next_sample_us &&
+            telemetry_copy_new_sample(&avoidance->latest_sample)) {
             avoidance->next_sample_us =
                 avoidance->latest_sample.timestamp_us +
                 ULTRASONIC_SAMPLE_PERIOD_MS * 1000LL;
@@ -721,6 +764,9 @@ void app_main(void)
     ESP_ERROR_CHECK(tft_display_init());
     ESP_ERROR_CHECK(infrared_init());
     ESP_ERROR_CHECK(ultrasonic_sensor_init(&ultrasonic_config));
+    ESP_ERROR_CHECK(xTaskCreatePinnedToCore(robot_telemetry_task, "robot_telemetry",
+                                           4096, NULL, 1, NULL, tskNO_AFFINITY)
+                       == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(car_control_stop());
 
     tracking_context_t tracking = {

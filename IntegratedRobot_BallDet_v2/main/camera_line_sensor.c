@@ -21,6 +21,9 @@
 #include "ball_transport_controller.h"
 #include "ball_target_detector.h"
 #include "tft_display.h"
+
+/* TFT is reserved for the wheel-speed/distance monitor in both missions. */
+#define CAMERA_TFT_PREVIEW_ENABLED 0
 #include "white_ball_detector.h"
 
 #define TAG "camera_line"
@@ -348,8 +351,10 @@ static void analyse_rgb565(uint16_t *pixels, uint16_t width, uint16_t height)
     const int64_t now_us = esp_timer_get_time();
     if (now_us - s_last_display_us >= CAMERA_DISPLAY_PERIOD_US) {
         s_last_display_us = now_us;
-        ESP_ERROR_CHECK_WITHOUT_ABORT(tft_display_show_camera_debug(
+        if (CAMERA_TFT_PREVIEW_ENABLED) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(tft_display_show_camera_debug(
             pixels, width, height, next.dark_percent, next.black));
+        }
     }
 }
 
@@ -435,21 +440,33 @@ static void frame_task(void *arg)
                     const int64_t now_us = esp_timer_get_time();
                     ball_transport_controller_submit(
                         &ball, &target, active_color, output.width,
-                        output.height, now_us);
+                        output.height, now_us, detection.black_ahead);
                     if (now_us >= next_ball_log_us) {
                         next_ball_log_us = now_us + 1500000LL;
                         ESP_LOGI(TAG,
                                  "%s ball=%d center=(%+.2f,%+.2f) "
-                                 "target=%d center=(%+.2f,%+.2f)",
+                                 "target=%d center=(%+.2f,%+.2f) "
+                                 "bottom=%.2f box=%ux%u left_mask=%d right_mask=%d "
+                                 "black_ahead=%d dark=%u%%",
                                  active_color == BALL_COLOR_WHITE
                                      ? "white" : "orange",
                                  ball.valid, ball.center_x, ball.center_y,
                                  target.valid, target.center_x,
-                                 target.center_y);
+                                 target.center_y,
+                                 target.valid ? (float)(target.bottom + 1U) /
+                                     output.height : 0.0f,
+                                 target.valid ? (unsigned)(target.right - target.left + 1U) : 0U,
+                                 target.valid ? (unsigned)(target.bottom - target.top + 1U) : 0U,
+                                 detector.white_left_mask_active,
+                                 detector.orange_right_mask_active,
+                                 detection.black_ahead,
+                                 (unsigned)detection.black_ahead_percent);
                     }
                 }
                 if (!detection_ok) {
+                    const bool keep_left_mask = detector.white_left_mask_active;
                     bt_detector_init(&detector);
+                    detector.white_left_mask_active = keep_left_mask;
                     ESP_LOGW(TAG, "BallDet v2 failed: %s",
                              esp_err_to_name(detection_error));
                 }
@@ -470,9 +487,11 @@ static void frame_task(void *arg)
                 if (display_us - s_last_display_us >=
                     CAMERA_DISPLAY_PERIOD_US) {
                     s_last_display_us = display_us;
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(
+                    if (CAMERA_TFT_PREVIEW_ENABLED) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
                         tft_display_show_camera_frame(
                             framebuffer, output.width, output.height));
+        }
                 }
             }
         }

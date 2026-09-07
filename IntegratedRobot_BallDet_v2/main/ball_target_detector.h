@@ -38,6 +38,9 @@ typedef struct {
     bool ball_valid;
     bool orange_ball_valid;
     bool target_valid;
+    /* Independent near-floor stop signal, with no target shape/ball gate. */
+    bool black_ahead;
+    uint8_t black_ahead_percent;
     bt_ball_t ball; /* Stable white ball. */
     bt_ball_t orange_ball;
     bt_target_t target; /* Stable left black target. */
@@ -49,6 +52,10 @@ typedef struct {
 typedef struct {
     /* Set only after the white-ball delivery; init defaults to false. */
     bool white_delivery_complete;
+    /* Latched after seeing two black blocks; cleared after white delivery. */
+    bool white_left_mask_active;
+    /* Enabled on the orange leg, including after a detector reset. */
+    bool orange_right_mask_active;
     bool ball_has_candidate;
     bt_ball_t ball_candidate;
     uint8_t ball_consecutive_frames;
