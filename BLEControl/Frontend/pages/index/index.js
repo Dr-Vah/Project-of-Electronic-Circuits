@@ -6,7 +6,8 @@
 //   服务 UUID：      6E400001-B5A3-F393-E0A9-E50E24DCCA9E  (Nordic UART Service)
 //   写特征值 UUID：  6E400002-B5A3-F393-E0A9-E50E24DCCA9E  (可写 / Write)
 //   数据帧格式：     "#vx,vy,w!"
-//      vx=左右(X)速度、vy=前后(Y)速度（-0.2~0.2 m/s），w=旋转角速度（rad/s）。
+//      vx=左右(X)速度、vy=前后(Y)速度（-0.2~0.2 m/s），
+//      w=旋转速度（rad/s），由手机方向角（罗盘 0~360°）相对参考方向换算而来。
 // ============================================================================
 
 const DEVICE_NAME = 'ESP32_CAR';
@@ -18,9 +19,9 @@ const DEADBAND = 0.15;                 // 死区
 const MAX_SPEED = 0.2;                 // 满速 0.2 m/s
 const FULL_TILT = 1.0;                 // 90° 时原始重力分量
 const SPEED_PER_G = MAX_SPEED / FULL_TILT; // 0.2：90° 对应满速的线性增益
-const GYRO_DEADBAND = 0.05;            // 旋转死区（rad/s）
+const HEADING_DEADBAND_DEG = 8;        // 旋转死区（度）
 const MAX_OMEGA = 0.5;                 // 满旋转速度（rad/s）
-const ROTATION_GAIN = 1.0;             // 小车转速 = 手机转速 × 此系数（越低转得越慢）
+const HEADING_GAIN = MAX_OMEGA / 45;   // 方向偏离 45° 即满速（每度对应的 rad/s）
 const SEND_INTERVAL_MS = 100;
 
 // 去掉 UUID 里的连字符并转大写，便于跨平台（iOS 返回完整 UUID，Android 可能返回短 UUID）比较。
@@ -37,6 +38,11 @@ function stringToArrayBuffer(str) {
   return buffer;
 }
 
+// 把任意角度差归一化到 -180 ~ 180 度（处理 0°/360° 跨越问题）
+function normalizeAngleDelta(d) {
+  return ((d + 180) % 360 + 360) % 360 - 180;
+}
+
 Page({
   data: {
     statusText: '未连接',
@@ -46,12 +52,15 @@ Page({
     characteristicId: '',
     x_val: '0.00',
     y_val: '0.00',
+    heading_val: '0',
     w_val: '0.00'
   },
 
   onLoad() {
     this._lastSendTime = 0;
     this._w = 0;
+    this._heading = 0;
+    this._referenceHeading = null;
 
     // 体感采集独立于蓝牙连接启动：未连接小车时也能在屏幕上看到 X/Y 变化，
     // 连接成功后才把数值发送给小车。
@@ -216,15 +225,37 @@ Page({
       }
     });
 
-    // 启动陀螺仪采集旋转角速度（z 轴 = 手机在水平面内转动）
-    if (wx.offGyroscopeChange) wx.offGyroscopeChange();
-    wx.startGyroscope({ interval: 'game' });
-    wx.onGyroscopeChange((res) => {
-      let w = res.z * ROTATION_GAIN;
-      if (Math.abs(w) < GYRO_DEADBAND) w = 0;
+    // 启动罗盘采集方向角（0~360°），用于控制旋转
+    if (wx.offCompassChange) wx.offCompassChange();
+    wx.startCompass({
+      fail: () => {
+        console.warn('该设备不支持罗盘/方向角，旋转控制不可用');
+      }
+    });
+    wx.onCompassChange((res) => {
+      const heading = res.direction; // 0~360°，正北为 0，顺时针增大
+      this._heading = heading;
+
+      // 首次读到方向角时，锁定当前朝向为参考（归零）
+      if (this._referenceHeading === null || this._referenceHeading === undefined) {
+        this._referenceHeading = heading;
+      }
+
+      // 相对参考方向的偏差，归一化到 -180 ~ 180 度
+      const delta = normalizeAngleDelta(heading - this._referenceHeading);
+
+      // 死区 + 线性映射到旋转速度（偏离 45° 即满速）
+      let w = 0;
+      if (Math.abs(delta) > HEADING_DEADBAND_DEG) {
+        w = delta * HEADING_GAIN;
+      }
       w = Math.max(-MAX_OMEGA, Math.min(MAX_OMEGA, w));
+
       this._w = w;
-      this.setData({ w_val: w.toFixed(2) });
+      this.setData({
+        heading_val: heading.toFixed(0),
+        w_val: w.toFixed(2)
+      });
     });
   },
 
@@ -254,8 +285,15 @@ Page({
   stopSensor() {
     if (wx.stopAccelerometer) wx.stopAccelerometer();
     if (wx.offAccelerometerChange) wx.offAccelerometerChange();
-    if (wx.stopGyroscope) wx.stopGyroscope();
-    if (wx.offGyroscopeChange) wx.offGyroscopeChange();
+    if (wx.stopCompass) wx.stopCompass();
+    if (wx.offCompassChange) wx.offCompassChange();
+  },
+
+  // 归零：把当前手机朝向锁定为参考方向（旋转的“正中”）
+  zeroHeading() {
+    this._referenceHeading = this._heading;
+    this._w = 0;
+    this.setData({ w_val: '0.00' });
   },
 
   disconnect() {

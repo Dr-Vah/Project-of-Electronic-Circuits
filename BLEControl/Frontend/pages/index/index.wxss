@@ -32,6 +32,12 @@ button {
   border: 1rpx solid #d9d9d9;
 }
 
+.zero {
+  background-color: #f7f7f7;
+  color: #333;
+  border: 1rpx solid #d9d9d9;
+}
+
 .data-box {
   width: 100%;
   margin-top: 100rpx;
