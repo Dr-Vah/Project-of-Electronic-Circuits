@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<title>全向车遥控</title><style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101721;color:#edf4ff}*{box-sizing:border-box}body{margin:0;padding:22px 20px max(22px,env(safe-area-inset-bottom));user-select:none;-webkit-user-select:none}main{max-width:440px;margin:auto}header{display:flex;align-items:center;justify-content:space-between}h1{font-size:23px;margin:0}small{color:#9cb0c8}#status{margin:18px 0;padding:12px;background:#1e2b3c;border-radius:12px;min-height:46px}button{font:inherit;color:inherit;border:1px solid #42546b;border-radius:14px;background:#25344a;min-height:54px;touch-action:none}button:active{background:#426591}button:focus-visible{outline:3px solid #64dbcf}.setting{display:flex;justify-content:space-between;align-items:center;margin:20px 0}select{font:inherit;padding:9px;border-radius:8px;background:#25344a;color:white;border:1px solid #42546b}#pad{position:relative;margin:20px auto;width:min(72vw,290px);aspect-ratio:1;border:1px solid #476079;border-radius:50%;background:radial-gradient(circle,#243f55,#162333);touch-action:none;overflow:hidden}#pad:before,#pad:after{content:'';position:absolute;background:#3b5369}#pad:before{width:1px;height:100%;left:50%}#pad:after{height:1px;width:100%;top:50%}#knob{position:absolute;left:50%;top:50%;width:70px;height:70px;margin:-35px;border-radius:50%;background:#70e2d0;box-shadow:0 4px 20px #0006;pointer-events:none}.dir{position:absolute;color:#a8bbce;font-size:13px}.up{top:12px;left:calc(50% - 13px)}.down{bottom:12px;left:calc(50% - 13px)}.left{left:12px;top:calc(50% - 9px)}.right{right:12px;top:calc(50% - 9px)}.row{display:flex;gap:12px}.row button{flex:1}#stop{width:100%;margin-top:20px;background:#aa3444;border-color:#ef6b7b;font-weight:700;font-size:20px}p{color:#a7bad0;line-height:1.65;font-size:14px;text-align:center}#values{text-align:center;color:#70e2d0;font-variant-numeric:tabular-nums}footer{margin-top:20px;font-size:12px;color:#8295ab;text-align:center}
+/* Keep live view and controls close together on a phone. */
+#cameraBox{position:relative;background:#070b10;border-radius:14px;overflow:hidden;height:170px;margin:12px 0}#camera{width:100%;height:100%;object-fit:contain;transform:rotate(180deg)}#camera[hidden]{display:none}#cameraNote{position:absolute;bottom:0;left:0;right:0;background:#101721d9;margin:0;padding:6px;font-size:12px}.cameraTools{display:flex;gap:8px}.cameraTools button{min-height:36px;font-size:13px;flex:1}#pad{width:min(54vw,210px);margin:12px auto}#status{margin:10px 0}.setting{margin:12px 0}#stop{position:sticky;bottom:8px;z-index:2}#moodStatus{padding:10px;background:#1e2b3c;border-radius:10px}p{margin:10px 0}
+@media(max-width:600px){body{padding:12px}#cameraBox{height:128px;margin:8px 0}#pad{width:164px;margin:8px auto}.setting{margin:8px 0}#status{padding:8px;font-size:13px;min-height:34px;margin:8px 0}#values{font-size:12px}.row button{min-height:44px}#stop{min-height:48px;margin-top:10px}#driveTip{font-size:12px;line-height:1.3;margin:7px 0}#speed{padding:5px}header small{font-size:11px}}
+</style></head><body><main>
+<header><h1>全向车遥控</h1><small>手机体感 · 奶蛙 V5</small></header>
+<div id="cameraBox"><img id="camera" alt="车载摄像头画面" hidden><p id="cameraNote" role="status">视频未开启</p></div>
+<div class="cameraTools"><button id="videoToggle">开启画面</button><button id="videoRotate">翻转画面 180°</button></div>
+<div id="status" role="status">按住摇杆或旋转按钮开始驾驶</div>
+<div class="row"><button id="joystickMode">触屏摇杆</button><button id="tiltMode">启用手机倾斜</button></div>
+<p id="tiltStatus" role="status">体感需使用已信任证书的 HTTPS 页面。</p>
+<details id="tlsHelp"><summary>首次使用体感：证书与连接</summary><p>先<a href="/omni-root.cer">下载小车证书</a>，按使用说明在手机安装并信任，再打开 <a href="https://192.168.4.1/">HTTPS 控制页</a>。普通 HTTP 页面仍可用摇杆。</p></details>
+<div class="setting"><label for="speed">速度档位</label><select id="speed"><option value="0.5">低速 · 0.06 m/s</option><option value="0.75">中速 · 0.09 m/s</option><option value="1">标准 · 0.12 m/s</option></select></div>
+<div id="pad" role="group" aria-label="按住并拖动控制平移"><span class="dir up">前</span><span class="dir down">后</span><span class="dir left">左</span><span class="dir right">右</span><div id="knob"></div></div>
+<div id="values">横移 0% · 前进 0% · 旋转 0%</div>
+<button id="tiltHold" hidden style="width:100%;background:#24695f">按住驾驶 · 按下自动校准</button>
+<p id="driveTip">按住拖动平移，另一根手指按住旋转；全部松开停车。</p>
+<div class="row"><button id="left">↶ 按住左转</button><button id="right">按住右转 ↷</button></div>
+<button id="stop">立即停止</button>
+<div class="setting"><label for="emoji">奶蛙表情 · 12 款双帧动画</label><select id="emoji"><option value="-1">自动情绪</option><option value="0">😴 呼呼睡</option><option value="1">😄 开心</option><option value="2">😎 酷酷开车</option><option value="3">💗 抱心</option><option value="4">😵 转晕了</option><option value="5">🥺 委屈掉线</option><option value="6">👀 左右张望</option><option value="7">🤣 捧腹大笑</option><option value="8">🥱 累到哈欠</option><option value="9">😮 吓一跳</option><option value="10">😤 气鼓鼓</option><option value="11">👍 得意点赞</option></select></div>
+<p id="emojiStatus" role="status">自动情绪：开车耍酷，转圈会晕，久开打哈欠；停车 5 秒张望，15 秒入睡。也可手选表情。</p>
+<p id="moodStatus" role="status">正在读取小车情绪…</p>
+<footer>断联自动停车 · 同时仅允许一个驾驶端<br>前方以原车红外模块朝向为准</footer>
+</main><script>
+'use strict';
+const el=id=>document.getElementById(id);
+let token=0,seq=0,generation=0,claiming=false,sending=false;
+let px=0,py=0,padPointer=null;
+let driveMode='joystick',tiltPointer=null,tiltSample=null,neutral=null;
+const sensorNow=()=>performance.now();
+const screenAngle=()=>Number(window.screen?.orientation?.angle??window.orientation??0);
+function tiltAxes(beta,gamma,base,angle){
+ const b=((beta-base.beta+540)%360)-180,g=gamma-base.gamma,r=angle*Math.PI/180;
+ const right=g*Math.cos(r)+b*Math.sin(r),forward=-(b*Math.cos(r)-g*Math.sin(r));
+ const scale=a=>Math.sign(a)*Math.min(1,Math.max(0,(Math.abs(a)-5)/20));
+ let x=scale(right),y=scale(forward),n=Math.hypot(x,y);if(n>1){x/=n;y/=n;}return{x,y};
+}
+const turns=new Map();
+const held=()=>driveMode==='tilt'?tiltPointer!==null:padPointer!==null||turns.size>0;
+const turn=()=>Math.sign([...turns.values()].reduce((a,b)=>a+b,0));
+function message(s){el('status').textContent=s;}
+function render(){const radius=el('pad').getBoundingClientRect().width/2-35;el('knob').style.transform=`translate(${px*radius}px,${-py*radius}px)`;el('values').textContent=`横移 ${Math.round(px*100)}% · 前进 ${Math.round(py*100)}% · 旋转 ${turn()*100}%`;}
+async function post(path,data){
+ const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),path==='command'?220:1800);
+ try{const r=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json','X-Remote':'1'},body:JSON.stringify(data),signal:abort.signal,cache:'no-store'});if(!r.ok){const e=Error('http');e.status=r.status;throw e;}return await r.json();}
+ finally{clearTimeout(timer);}
+}
+function reset(text){generation++;token=0;padPointer=null;tiltPointer=null;neutral=null;turns.clear();px=py=0;render();message(text);}
+function connectionError(e){return e.name==='AbortError'?'请求超时：请检查热点连接，暂停视频后重试':e.status?'小车接口返回 HTTP '+e.status:'无法连接小车：请检查热点、页面地址和 HTTPS 证书信任';}
+function stop(){reset('已松开控制；正在发送停车请求');const g=generation;void post('stop',{}).catch(e=>{if(g===generation&&!held())message(connectionError(e)+'；停车请求未确认，小车由断联保护停车');});}
+async function claim(){
+ if(token||claiming||!held())return;
+ claiming=true;const g=generation;message('正在获取驾驶权…');
+ try{const r=await post('claim',{});if(g!==generation||!held()){return;}token=r.token;seq=0;message('驾驶中 · 松开全部控制停车');}
+ catch(e){if(g===generation)reset(e.status===409?'驾驶权仍被占用；松开全部控制，等 1 秒后重试':connectionError(e));}
+ finally{claiming=false;}
+}
+async function tick(){
+ if(driveMode==='tilt'&&held()&&(!tiltSample||sensorNow()-tiltSample.time>300||screenAngle()!==neutral.angle)){
+  stop();message('姿态数据中断或屏幕方向改变；重新按住校准');return;
+ }
+ if(sending||!token||!held())return;
+ sending=true;const g=generation,k=Number(el('speed').value);
+ try{await post('command',{token,seq:++seq,x:px*k,y:py*k,turn:turn()*k});}
+ catch(e){if(g===generation)reset('控制已中断；重新按住连接');}
+ finally{sending=false;}
+}
+function released(){render();if(!held())stop();}
+const pad=el('pad');
+function move(e){if(e.pointerId!==padPointer)return;const r=pad.getBoundingClientRect(),radius=r.width/2-35;let x=(e.clientX-r.left-r.width/2)/radius,y=-(e.clientY-r.top-r.height/2)/radius;const n=Math.hypot(x,y);if(n<0.10){x=y=0;}else{const scale=Math.min(1,(n-.10)/.90)/n;x*=scale;y*=scale;}px=x;py=y;render();}
+pad.addEventListener('pointerdown',e=>{if(driveMode!=='joystick'||padPointer!==null)return;e.preventDefault();padPointer=e.pointerId;pad.setPointerCapture(e.pointerId);move(e);void claim();});
+pad.addEventListener('pointermove',move);
+function padUp(e){if(e.pointerId!==padPointer)return;padPointer=null;px=py=0;released();}
+for(const event of ['pointerup','pointercancel','lostpointercapture'])pad.addEventListener(event,padUp);
+for(const [id,value] of [['left',1],['right',-1]]){
+ const b=el(id);
+ b.addEventListener('pointerdown',e=>{if(driveMode==='tilt'&&tiltPointer===null){message('体感模式请先按住驾驶键');return;}e.preventDefault();b.setPointerCapture(e.pointerId);turns.set(e.pointerId,value);render();void claim();});
+ for(const event of ['pointerup','pointercancel','lostpointercapture'])b.addEventListener(event,e=>{if(turns.delete(e.pointerId))released();});
+}
+el('stop').addEventListener('pointerdown',stop);
+el('stop').addEventListener('click',stop);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});
+window.addEventListener('pagehide',stop);window.addEventListener('blur',stop);
+window.addEventListener('orientationchange',stop);
+document.addEventListener('contextmenu',e=>e.preventDefault());
+el('joystickMode').addEventListener('click',()=>{stop();driveMode='joystick';pad.hidden=false;el('tiltHold').hidden=true;el('tiltStatus').textContent='触屏摇杆模式';el('driveTip').textContent='按住拖动平移，另一根手指按住旋转；全部松开停车。';});
+el('tiltMode').addEventListener('click',async()=>{
+ stop();driveMode='joystick';pad.hidden=false;el('tiltHold').hidden=true;const g=generation;
+ if(!window.isSecureContext){el('tiltStatus').textContent='请先安装并信任小车证书，再打开 HTTPS 地址';return;}
+ const api=window.DeviceOrientationEvent;
+ if(!api){el('tiltStatus').textContent='当前浏览器没有姿态接口，请使用手机 Safari 或 Chrome';return;}
+ try{
+  if(typeof api.requestPermission==='function'&&await api.requestPermission()!=='granted')throw Error('denied');
+  if(g!==generation)return;
+  driveMode='tilt';pad.hidden=true;el('tiltHold').hidden=false;
+  el('tiltStatus').textContent='将手机屏幕朝上、略微倾斜握持，等待姿态读数后按住驾驶';
+  el('driveTip').textContent='按下时以当前姿态校准；前后左右倾斜控制平移，松开驾驶键全部停车。';
+ }catch(e){if(g===generation)el('tiltStatus').textContent='姿态授权未通过；请允许运动与方向访问后重试，或用摇杆';}
+});
+window.addEventListener('deviceorientation',e=>{
+ if(!Number.isFinite(e.beta)||!Number.isFinite(e.gamma)||Math.abs(e.beta)>75||Math.abs(e.gamma)>75){
+  tiltSample=null;if(driveMode==='tilt'&&held()){stop();message('手机倾斜过大或姿态无效，已停止；请放平后重新按住');}return;
+ }
+ const now=sensorNow(),dt=tiltSample?Math.max(0,now-tiltSample.time):0;
+ tiltSample={beta:e.beta,gamma:e.gamma,time:now};
+ if(driveMode!=='tilt')return;
+ el('tiltStatus').textContent=`体感就绪 · 前后 ${e.beta.toFixed(0)}° / 左右 ${e.gamma.toFixed(0)}°`;
+ if(tiltPointer!==null&&neutral){
+  const axes=tiltAxes(e.beta,e.gamma,neutral,neutral.angle),a=1-Math.exp(-Math.min(dt,100)/80);
+  px+=a*(axes.x-px);py+=a*(axes.y-py);render();
+ }
+});
+el('tiltHold').addEventListener('pointerdown',e=>{
+ if(driveMode!=='tilt'||tiltPointer!==null)return;
+ e.preventDefault();
+ if(!tiltSample||sensorNow()-tiltSample.time>300){message('还没有新鲜姿态数据，请轻微倾斜手机后重试');return;}
+ tiltPointer=e.pointerId;neutral={beta:tiltSample.beta,gamma:tiltSample.gamma,angle:screenAngle()};
+ px=py=0;render();el('tiltHold').setPointerCapture(e.pointerId);void claim();
+});
+for(const event of ['pointerup','pointercancel','lostpointercapture'])el('tiltHold').addEventListener(event,e=>{if(e.pointerId===tiltPointer)stop();});
+setInterval(tick,50);
+el('tlsHelp').hidden=window.isSecureContext===true;
+let emojiBusy=false;
+el('emoji').addEventListener('change',async()=>{
+ if(emojiBusy)return;
+ emojiBusy=true;el('emoji').disabled=true;
+ try{await post('emoji',{face:Number(el('emoji').value),token});el('emojiStatus').textContent='表情设置已发送；断联提示优先显示。';}
+ catch(e){el('emojiStatus').textContent='表情未更新：请检查连接或等待其他驾驶端松手，再重新选择。';}
+ finally{emojiBusy=false;el('emoji').disabled=false;}
+});
+</script><script>
+'use strict';
+// Video and telemetry never call the motion API or refresh its watchdog.
+const view=document.getElementById('camera'),note=document.getElementById('cameraNote');
+let videoOn=false,videoBusy=false,videoAbort=null,videoGeneration=0,rotation=180,currentURL=null,lastFrame=null;
+document.getElementById('videoRotate').addEventListener('click',()=>{rotation=(rotation+180)%360;view.style.transform=`rotate(${rotation}deg)`;});
+function pauseVideo(){videoOn=false;videoGeneration++;if(videoAbort)videoAbort.abort();view.hidden=true;if(currentURL){URL.revokeObjectURL(currentURL);currentURL=null;}document.getElementById('videoToggle').textContent='开启画面';note.textContent='视频已暂停';}
+document.getElementById('videoToggle').addEventListener('click',()=>{if(videoOn)pauseVideo();else{videoOn=true;videoGeneration++;lastFrame=null;document.getElementById('videoToggle').textContent='暂停画面';note.textContent='正在连接摄像头…';void videoTick();}});
+async function videoTick(){
+ if(!videoOn||videoBusy||document.hidden)return;
+ videoBusy=true;const generation=videoGeneration;videoAbort=new AbortController();
+ const timeout=setTimeout(()=>videoAbort.abort(),900);
+ try{
+  const started=performance.now();
+ const response=await fetch(`${location.protocol==='https:'?'https:':'http:'}//${location.hostname}:${location.protocol==='https:'?8443:81}/frame.jpg`,{signal:videoAbort.signal,cache:'no-store'});
+  if(!response.ok)throw Error('camera');
+  const sequence=response.headers.get('X-Frame-Sequence'),age=Number(response.headers.get('X-Frame-Age-Ms'));
+  const blob=await response.blob();
+  if(generation!==videoGeneration||!videoOn)return;
+  if(!sequence||!Number.isFinite(age)||performance.now()-started+age>1000)throw Error('stale');
+  if(sequence===lastFrame)return;
+  lastFrame=sequence;
+  const url=URL.createObjectURL(blob),old=currentURL;currentURL=url;view.src=url;if(old)URL.revokeObjectURL(old);
+  try{await view.decode();}catch(e){throw Error('decode');}
+  if(generation!==videoGeneration||!videoOn)return;
+  if(performance.now()-started+age>1000)throw Error('stale');
+  view.hidden=false;
+  note.textContent=`实时预览 · 本次接收 ${Math.round(performance.now()-started)} ms`;
+ }catch(e){if(generation===videoGeneration){view.hidden=true;lastFrame=null;if(currentURL){URL.revokeObjectURL(currentURL);currentURL=null;}note.textContent='画面不可用或已过期，请目视驾驶；正在重试';}}
+ finally{clearTimeout(timeout);videoBusy=false;}
+}
+let moodBusy=false;
+async function moodTick(){
+ if(moodBusy||document.hidden||(typeof held==='function'&&held()))return;
+ moodBusy=true;const abort=new AbortController(),timeout=setTimeout(()=>abort.abort(),400);
+ try{const response=await fetch('/api/status',{signal:abort.signal,cache:'no-store'});if(!response.ok)throw Error();const m=await response.json();
+ const faces=['😴 呼呼睡','😄 开心','😎 酷酷开车','💗 抱心','😵 转晕了','🥺 委屈掉线','👀 左右张望','🤣 捧腹大笑','🥱 累到哈欠','😮 吓一跳','😤 气鼓鼓','👍 得意点赞'];
+ document.getElementById('moodStatus').textContent=`${faces[m.face]||'待机'} · 眩晕 ${m.dizzy}% · 疲劳 ${m.fatigue}%${m.manual>=0?' · 手动表情':''}`;
+ }catch(e){document.getElementById('moodStatus').textContent='情绪状态暂不可用';}
+ finally{clearTimeout(timeout);moodBusy=false;}
+}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)pauseVideo();});
+window.addEventListener('pagehide',pauseVideo);
+setInterval(videoTick,200);setInterval(moodTick,500);
+</script></body></html>
