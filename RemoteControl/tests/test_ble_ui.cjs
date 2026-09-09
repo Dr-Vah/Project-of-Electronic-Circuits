@@ -81,3 +81,19 @@ setTimeout(()=>{
   late();assert(!slow.active);assert.equal(timeoutFaults,1);
   console.log('BLE write timeout and late callback test passed');
 },250);
+
+// Landscape physical poses: phone top left/right must produce the same screen-relative command.
+for(const [side,right,forward] of [
+  ['left',{x:0,y:-0.5,z:-0.86},{x:-0.5,y:0,z:-0.86}],
+  ['right',{x:0,y:0.5,z:-0.86},{x:0.5,y:0,z:-0.86}]
+]) {
+  const r=C.motion(right,zero,0,0,1,side),f=C.motion(forward,zero,0,0,1,side);
+  assert(r[0]>0);assert.equal(Math.abs(r[1]),0);
+  assert(f[1]>0);assert.equal(Math.abs(f[0]),0);
+  assert(C.motion(right,right,10,10,1,side).every(n=>n===0));
+}
+page.visible=true;page.data.connected=true;page.driver={active:false,arm(done){this.active=true;done();return true;},stop(){this.active=false;},drive(){}};accel(zero);page.toggleTilt();assert(page.held);
+page.changeGrip({currentTarget:{dataset:{grip:'right'}}});assert(!page.held);assert.equal(page.data.grip,'right');
+accel(zero);page.toggleTilt();assert(page.held);page.onResize();assert(!page.held);
+console.log('Landscape axis direction, neutral calibration, grip change and resize stop tests passed');
+

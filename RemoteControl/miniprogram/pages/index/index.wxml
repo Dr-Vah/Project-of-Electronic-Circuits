@@ -1,46 +1,44 @@
 <view class="page">
-  <view class="heading"><view><text class="eyebrow">OMNI REMOTE</text><view class="title">奶蛙驾驶舱</view></view><view class="badge {{connected ? 'online' : ''}}">{{connected ? '蓝牙已连接' : '蓝牙未连接'}}</view></view>
-  <view class="status">{{status}}</view>
-  <view class="connection-row">
-    <button class="primary" size="mini" bindtap="connect" disabled="{{connecting || connected}}">{{connecting ? '搜索中…' : '连接小车'}}</button>
-    <button size="mini" bindtap="connectWifi">连接画面 Wi-Fi</button>
-    <button size="mini" bindtap="disconnect" disabled="{{!connecting && !connected}}">断开</button>
+  <view class="header">
+    <view class="brand"><text class="accent">〃</text> 遥控驾驶舱 <text class="connection {{connected ? 'online' : ''}}">{{connected ? '● 已连接' : '○ 未连接'}}</text></view>
+    <view class="header-actions"><button class="primary" bindtap="connect" disabled="{{connecting || connected}}">{{connecting ? '搜索中' : '连接小车'}}</button><button bindtap="connectWifi">连接画面</button><button bindtap="toggleDetails">{{details ? '收起状态' : '连接状态'}}</button></view>
   </view>
-  <view class="hint wifi">{{wifiText}}</view>
-
-  <view class="video-card">
-    <view class="video-stage">
-      <image wx:for="{{frames}}" wx:key="*this" class="camera {{flipped ? 'flipped' : ''}} {{videoFresh ? '' : 'waiting-image'}}" src="{{item}}" mode="aspectFit" data-path="{{item}}" bindload="frameLoaded" binderror="frameError" />
-      <view wx:if="{{!videoFresh}}" class="video-placeholder"><text class="video-icon">◉</text><view>{{videoOn ? '正在等待小车画面' : '第一视角'}}</view><text class="hint">{{videoOn ? '请保持小车 Wi-Fi 连接' : '连接小车 Wi-Fi 后，点开启画面'}}</text></view>
-      <text wx:if="{{videoFresh}}" class="live-dot">● 实时</text>
+  <view class="dashboard">
+    <view class="panel movement">
+      <view class="section-title">{{mode === 'tilt' ? '体感控制' : '移动'}}</view>
+      <view wx:if="{{mode === 'joystick'}}" class="joy-area">
+        <view id="joystick" class="joystick" catchtouchstart="joyStart" catchtouchmove="joyMove" catchtouchend="joyEnd" catchtouchcancel="release"><text class="arrow up">▲</text><text class="arrow down">▼</text><text class="arrow left">◀</text><text class="arrow right">▶</text><view class="knob" style="transform:translate({{joyX}}px, {{joyY}}px)"></view></view>
+        <text class="hint">前后移动 · 左右横移</text>
+      </view>
+      <view wx:else class="tilt-area">
+        <view class="grip-label">手机顶端（听筒）朝向</view>
+        <view class="segments"><button class="{{grip === 'left' ? 'selected' : ''}}" data-grip="left" bindtap="changeGrip">朝左</button><button class="{{grip === 'right' ? 'selected' : ''}}" data-grip="right" bindtap="changeGrip">朝右</button></view>
+        <view class="sensor">{{sensor}}</view>
+        <button class="calibrate {{tiltLatched ? 'active' : ''}}" bindtap="toggleTilt">{{tiltLatched ? '停止体感' : '校准并开始'}}</button>
+        <text class="hint">{{tiltLatched ? '回到校准握姿即停止移动' : '保持舒适握姿，点击一次即可'}}</text>
+      </view>
+      <view class="speed"><text class="hint">速度选择</text><view class="segments"><button class="{{percent === 50 ? 'selected' : ''}}" data-scale="0.5" bindtap="speed">低</button><button class="{{percent === 75 ? 'selected' : ''}}" data-scale="0.75" bindtap="speed">中</button><button class="{{percent === 100 ? 'selected' : ''}}" data-scale="1" bindtap="speed">高</button></view></view>
     </view>
-    <view class="video-toolbar"><text>{{videoText}}</text><view class="video-buttons"><button size="mini" bindtap="toggleVideo">{{videoOn ? '暂停' : '开启画面'}}</button><button size="mini" bindtap="flipVideo">翻转 180°</button></view></view>
-  </view>
-
-  <view class="controls">
-    <view class="tabs"><view class="tab {{mode === 'tilt' ? 'selected' : ''}}" data-mode="tilt" bindtap="mode">手机体感</view><view class="tab {{mode === 'joystick' ? 'selected' : ''}}" data-mode="joystick" bindtap="mode">触屏摇杆</view></view>
-    <view class="speed-row"><text>限速</text><button size="mini" class="{{percent === 50 ? 'selected' : ''}}" data-scale="0.5" bindtap="speed">低</button><button size="mini" class="{{percent === 75 ? 'selected' : ''}}" data-scale="0.75" bindtap="speed">中</button><button size="mini" class="{{percent === 100 ? 'selected' : ''}}" data-scale="1" bindtap="speed">高</button><text>{{percent}}%</text></view>
-    <view wx:if="{{mode === 'tilt'}}">
-      <view class="sensor">{{sensor}}</view>
-      <view class="hint">{{sensorDetail}}</view>
-      <view class="speed-row"><text>转手机旋转（可选）</text><switch checked="{{useCompass}}" bindchange="toggleCompass" color="#285c43"/><button size="mini" bindtap="retrySensors">重新启用传感器</button></view>
-      <button class="drive {{tiltLatched ? 'active' : ''}}" bindtap="toggleTilt"><view>{{tiltLatched ? '体感驾驶中 · 点击停止' : '校准当前握姿并开始'}}</view><text class="drive-note">{{tiltLatched ? '无需按住 · 保持零点姿态停车 · 可随时立即停止' : '保持舒适握姿点击一次，之后倾斜即可驾驶'}}</text></button>
+    <view class="center">
+      <view class="tabs"><view class="tab {{mode === 'joystick' ? 'selected' : ''}}" data-mode="joystick" bindtap="mode">摇杆操控</view><view class="tab {{mode === 'tilt' ? 'selected' : ''}}" data-mode="tilt" bindtap="mode">手机体感</view></view>
+      <view class="video-stage">
+        <image wx:for="{{frames}}" wx:key="*this" class="camera {{flipped ? 'flipped' : ''}} {{videoFresh ? '' : 'waiting-image'}}" src="{{item}}" mode="aspectFit" data-path="{{item}}" bindload="frameLoaded" binderror="frameError" />
+        <text class="video-label">第一视角 {{videoFresh ? '· 实时' : ''}}</text>
+        <view wx:if="{{!videoFresh}}" class="video-placeholder"><view class="viewfinder">⌗</view><view>{{videoOn ? '正在等待小车画面' : '画面未开启'}}</view><text class="hint">{{videoOn ? videoText : '连接小车 Wi-Fi 后开启画面'}}</text></view>
+        <view class="video-actions"><button bindtap="flipVideo">翻转 180°</button><button bindtap="toggleVideo">{{videoOn ? '暂停画面' : '开启画面'}}</button></view>
+      </view>
+      <view class="status-line">{{status}}</view>
     </view>
-    <view wx:else class="joystick-row">
-      <view class="joy-label">前进 ↑<view>← 横移 →</view><view>↓ 后退</view></view>
-      <view id="joystick" class="joystick" catchtouchstart="joyStart" catchtouchmove="joyMove" catchtouchend="joyEnd" catchtouchcancel="release"><view class="cross horizontal"></view><view class="cross vertical"></view><view class="knob" style="transform:translate({{joyX}}px, {{joyY}}px)"></view></view>
-      <view class="joy-label">按住拖动<view>松手归零</view><view>可同时旋转</view></view>
+    <view class="panel actions">
+      <view class="section-title">转向</view>
+      <view class="turn-row"><view class="turn" data-sign="1" catchtouchmove="preventScroll" catchtouchstart="turnStart" catchtouchend="turnEnd" catchtouchcancel="release"><text>↶</text>左转</view><view class="turn" data-sign="-1" catchtouchmove="preventScroll" catchtouchstart="turnStart" catchtouchend="turnEnd" catchtouchcancel="release"><text>↷</text>右转</view></view>
+      <view class="hint turn-hint">按住旋转，松手停止</view>
+      <view class="face-section"><view class="section-title">屏幕表情</view><picker range="{{faceOptions}}" value="{{faceIndex}}" bindchange="chooseFace" disabled="{{!connected}}"><view class="face-picker">{{statusFresh ? faceOptions[faceIndex] : '等待同步'}}<text>⌄</text></view></picker></view>
+      <button class="stop" bindtap="release">立即停止</button>
     </view>
-    <view class="turn-row"><view class="turn" data-sign="1" catchtouchmove="preventScroll" catchtouchstart="turnStart" catchtouchend="turnEnd" catchtouchcancel="release">↶ 按住左转</view><view class="turn" data-sign="-1" catchtouchmove="preventScroll" catchtouchstart="turnStart" catchtouchend="turnEnd" catchtouchcancel="release">按住右转 ↷</view></view>
-    <view class="readout">左右 {{x}} · 前后 {{y}} m/s · 旋转 {{w}} rad/s</view>
   </view>
-
-  <view class="mood-card"><view class="mood-title"><text>奶蛙 · {{statusFresh ? faceName : '状态未更新'}}</text><text class="badge {{fault ? 'fault' : 'online'}}">{{fault ? '停车保护' : (statusFresh ? '已同步' : '等待同步')}}</text></view>
-    <view class="meter-row"><text>眩晕 {{statusFresh ? dizzy : '—'}}</text><progress percent="{{statusFresh ? dizzy : 0}}" stroke-width="5" activeColor="#be8bdf" /></view>
-    <view class="meter-row"><text>疲劳 {{statusFresh ? fatigue : '—'}}</text><progress percent="{{statusFresh ? fatigue : 0}}" stroke-width="5" activeColor="#dfad69" /></view>
-    <picker range="{{faceOptions}}" value="{{faceIndex}}" bindchange="chooseFace" disabled="{{!connected}}"><view class="face-picker">表情：{{statusFresh ? faceOptions[faceIndex] : '等待小车状态'}}<text>选择 ›</text></view></picker>
-    <view class="hint">表情与车载屏幕同步；切换表情会先停车。疲劳不是电量。</view>
+  <view wx:if="{{details}}" class="details">
+    <view class="details-heading"><text>连接与传感器状态</text><button bindtap="toggleDetails">关闭</button></view>
+    <scroll-view scroll-y class="details-body"><view>{{status}}</view><view class="hint">{{wifiText}}</view><view>{{videoText}}</view><view class="hint">{{sensorDetail}}</view><view class="setting"><text>转手机旋转（罗盘）</text><switch checked="{{useCompass}}" bindchange="toggleCompass" color="#ed922f"/></view><button bindtap="retrySensors">重新启用传感器</button><view class="hint">左右 {{x}} · 前后 {{y}} m/s · 旋转 {{w}} rad/s</view><view class="hint">眩晕 {{statusFresh ? dizzy : '—'}} · 疲劳 {{statusFresh ? fatigue : '—'}} · {{fault ? '停车保护' : '小车状态'}}（疲劳不是电量）</view><button bindtap="disconnect" disabled="{{!connecting && !connected}}">断开蓝牙</button></scroll-view>
   </view>
-  <view class="hint footer-note">切后台、断联或正在观看的画面中断会停车。确认环境后重新开启体感或按住摇杆。首次测试请架空车轮核对方向。</view>
 </view>
-<view class="stop-dock"><button class="stop" bindtap="release">立即停止</button></view>

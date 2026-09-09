@@ -13,7 +13,13 @@ function parseStatus(value) {
 const normalize = s => (s || '').replace(/-/g, '').toUpperCase();
 const delta = d => ((d + 180) % 360 + 360) % 360 - 180;
 const axis = (v, dead, full) => Math.sign(v) * Math.min(1, Math.max(0, (Math.abs(v)-dead)/(full-dead)));
-function motion(sample, zero, heading, reference, scale) {
+// Sensor axes remain in the phone's natural portrait coordinate frame.
+// Explicit grip selection also supports clients that cannot report 180° turns.
+function landscapeSample(s, side) {
+  return side==='right'?{x:s.y,y:-s.x,z:s.z}:{x:-s.y,y:s.x,z:s.z};
+}
+function motion(sample, zero, heading, reference, scale, side) {
+  if(side) { sample=landscapeSample(sample,side);zero=landscapeSample(zero,side); }
   let x=axis(sample.x-zero.x, 0.15, 0.7);
   // Phone top tilted down: negative Y gravity -> chassis forward (+Y).
   let y=-axis(sample.y-zero.y, 0.15, 0.7);
@@ -80,4 +86,4 @@ class Driver {
     else this.send('#STOP!');
   }
 }
-module.exports={SERVICE,WRITE,STATUS,FACES,parseStatus,normalize,delta,motion,frame,buffer,Driver};
+module.exports={SERVICE,WRITE,STATUS,FACES,parseStatus,normalize,delta,motion,landscapeSample,frame,buffer,Driver};

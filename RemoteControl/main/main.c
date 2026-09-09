@@ -22,11 +22,14 @@
 #include "local_tls.h"
 #include "ble_remote.h"
 #include "remote_ble_state.h"
+#include "driver/gpio.h"
+#include "voice_control.h"
 
 /* Conservative initial limits; chassis +x right, +y IR-facing front. */
 #define MAX_TRANSLATION REMOTE_MAX_TRANSLATION
 #define MAX_ROTATION REMOTE_MAX_ROTATION
 static remote_state_t state;
+static voice_control_t voice;
 static uint32_t ble_token;
 static bool ble_connected;
 static SemaphoreHandle_t mutex;
@@ -38,22 +41,30 @@ static mood_t mood;
 extern const char page_start[] asm("_binary_index_html_start");
 extern const char page_end[] asm("_binary_index_html_end");
 
+/* Caller holds mutex: TFT, HTTP and BLE use the same expression selection. */
+static int current_face(void) {
+    bool moving=(state.token&&(state.x!=0||state.y!=0||state.turn!=0))||voice.active;
+    return mood_face(&mood,manual_face,link_fault,moving);
+}
+
 /* HTTP and BLE share the same lease, motor task, limits and watchdog. */
 static bool ble_command(ble_command_t c) {
     uint32_t candidate=esp_random();if(!candidate)candidate=1;
     xSemaphoreTake(mutex,portMAX_DELAY);
     bool ok=remote_ble_apply(&state,&ble_token,&manual_face,&link_fault,c,esp_timer_get_time(),candidate);
+    if(ok && (c.kind==BLE_STOP || c.kind==BLE_ARM)) {
+        voice_cancel(&voice);
+    }
     xSemaphoreGive(mutex);
     return ok;
 }
 static void ble_status(uint8_t out[BLE_STATUS_SIZE]) {
     xSemaphoreTake(mutex,portMAX_DELAY);
-    bool moving=state.token&&(state.x!=0||state.y!=0||state.turn!=0);
     out[0]=1;
     out[1]=(uint8_t)fminf(100,fmaxf(0,mood.dizzy));
     out[2]=(uint8_t)fminf(100,fmaxf(0,mood.fatigue));
     out[3]=(uint8_t)fminf(255,fmaxf(0,mood.idle));
-    out[4]=(uint8_t)mood_face(&mood,manual_face,link_fault,moving);
+    out[4]=(uint8_t)current_face();
     out[5]=(uint8_t)(manual_face+1);
     out[6]=link_fault;
     out[7]=ble_token && state.token==ble_token;
@@ -81,16 +92,33 @@ static void control_task(void *arg) {
         remote_expire(&state, esp_timer_get_time());
         if(previous_token&&!state.token)link_fault=true;
         int64_t now=esp_timer_get_time();
-        bool active=state.token&&(state.x!=0||state.y!=0||state.turn!=0);
-        mood_step(&mood,(now-mood_time)/1000000.0f,active,state.token?state.turn:0);
+        if (voice_sample(&voice, gpio_get_level(VOICE_STOP_GPIO),
+                         gpio_get_level(VOICE_PA0_GPIO), gpio_get_level(VOICE_PA1_GPIO),
+                         now, state.token!=0)) {
+            remote_stop(&state);
+            ble_token=0;
+            link_fault=false;
+        }
+        float target_x=0,target_y=0,target_w=0;
+        if (state.token) {
+            target_x=state.x*MAX_TRANSLATION;
+            target_y=state.y*MAX_TRANSLATION;
+            target_w=state.turn*MAX_ROTATION;
+        } else {
+            voice_velocity(&voice,&target_y,&target_w);
+            if (voice.active) link_fault=false;
+        }
+        bool active=target_x!=0||target_y!=0||target_w!=0;
+        mood_step(&mood,(now-mood_time)/1000000.0f,active,
+                  state.token?state.turn:target_w/MAX_ROTATION);
         mood_time=now;
-        if (!state.token || (state.x==0 && state.y==0 && state.turn==0)) {
+        if (!active) {
             x=y=w=0;
             car_control_stop();
         } else {
-            x=approach(x,state.x*MAX_TRANSLATION,0.004f);
-            y=approach(y,state.y*MAX_TRANSLATION,0.004f);
-            w=approach(w,state.turn*MAX_ROTATION,0.02f);
+            x=approach(x,target_x,0.004f);
+            y=approach(y,target_y,0.004f);
+            w=approach(w,target_w,0.02f);
             car_control_set_velocity(x,y,w);
         }
         xSemaphoreGive(mutex);
@@ -106,7 +134,7 @@ static void display_task(void *arg) {
     int last_face=-2;unsigned last_phase=2;bool last_link=false;
     while(true) {
         xSemaphoreTake(mutex,portMAX_DELAY);
-        int face=mood_face(&mood,manual_face,link_fault,state.token&&(state.x!=0||state.y!=0||state.turn!=0));
+        int face=current_face();
         bool linked=(station_count>0||ble_connected)&&!link_fault;
         xSemaphoreGive(mutex);
         /* Slow idle breathing, livelier driving/laughter. No heap allocation. */
@@ -139,7 +167,7 @@ static esp_err_t page(httpd_req_t *r) {
 static esp_err_t status_http(httpd_req_t *r) {
     char body[200];
     xSemaphoreTake(mutex,portMAX_DELAY);
-    int face=mood_face(&mood,manual_face,link_fault,state.token&&(state.x!=0||state.y!=0||state.turn!=0));
+    int face=current_face();
     snprintf(body,sizeof(body),"{\"dizzy\":%.0f,\"fatigue\":%.0f,\"idle\":%.0f,\"face\":%d,\"manual\":%d,\"fault\":%s}",
         mood.dizzy,mood.fatigue,mood.idle,face,manual_face,link_fault?"true":"false");
     xSemaphoreGive(mutex);
@@ -175,7 +203,7 @@ static esp_err_t api(httpd_req_t *r) {
     remote_expire(&state,now);
     if(previous_token&&!state.token)link_fault=true;
     if (!strcmp(r->uri,"/api/stop")) {
-        remote_stop(&state); ble_token=0; ok=true;
+        remote_stop(&state); voice_cancel(&voice); ble_token=0; ok=true;
     } else if (!strcmp(r->uri,"/api/emoji")) {
         double f,t=0;
         number(j,"token",&t);
@@ -186,7 +214,7 @@ static esp_err_t api(httpd_req_t *r) {
     } else if (!strcmp(r->uri,"/api/claim")) {
         token=esp_random(); if(!token) token=1;
         ok=remote_claim(&state,token,now);
-        if(ok) { link_fault=false;ble_token=0; }
+        if(ok) { voice_cancel(&voice);link_fault=false;ble_token=0; }
     } else {
         double t,q,x,y,w;
         if(number(j,"token",&t)&&number(j,"seq",&q)&&number(j,"x",&x)&&number(j,"y",&y)&&number(j,"turn",&w)
@@ -210,7 +238,7 @@ static void wifi_event(void *arg,esp_event_base_t base,int32_t id,void *data) {
     if(id==WIFI_EVENT_AP_STADISCONNECTED) {
         xSemaphoreTake(mutex,portMAX_DELAY);
         if(station_count)station_count--;
-        remote_stop(&state);link_fault=true;
+        remote_stop(&state);voice_cancel(&voice);link_fault=true;
         xSemaphoreGive(mutex);
     }
 }
@@ -218,6 +246,16 @@ void app_main(void) {
     mutex=xSemaphoreCreateMutex(); configASSERT(mutex);
     car_control_config_t car=CAR_CONTROL_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(car_control_init(&car));
+    gpio_config_t voice_pins={
+        .pin_bit_mask=(1ULL<<VOICE_STOP_GPIO), .mode=GPIO_MODE_INPUT,
+        .pull_up_en=GPIO_PULLUP_ENABLE, .pull_down_en=GPIO_PULLDOWN_DISABLE,
+        .intr_type=GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&voice_pins));
+    voice_pins.pin_bit_mask=(1ULL<<VOICE_PA0_GPIO)|(1ULL<<VOICE_PA1_GPIO);
+    voice_pins.pull_up_en=GPIO_PULLUP_DISABLE;
+    voice_pins.pull_down_en=GPIO_PULLDOWN_ENABLE;
+    ESP_ERROR_CHECK(gpio_config(&voice_pins));
     configASSERT(xTaskCreate(control_task,"remote_control",3072,NULL,6,NULL)==pdPASS);
     configASSERT(xTaskCreate(display_task,"emoji_display",4096,NULL,2,NULL)==pdPASS);
     esp_err_t e=nvs_flash_init();

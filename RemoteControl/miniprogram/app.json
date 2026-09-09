@@ -1,5 +1,5 @@
 {
   "pages": ["pages/index/index"],
-  "window": {"navigationBarTitleText": "奶蛙 · BLE 体感", "navigationBarBackgroundColor": "#eef5ef"},
+  "window": {"navigationBarTitleText": "遥控驾驶舱", "navigationBarBackgroundColor": "#181b20", "navigationBarTextStyle":"white"},
   "style": "v2"
 }

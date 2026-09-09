@@ -2,7 +2,7 @@ const C=require('../../utils/control');
 const {Video}=require('../../utils/video');
 Page({
   data:{status:'未连接',connected:false,connecting:false,driving:false,percent:50,
-    sensor:'等待传感器',sensorDetail:'',useCompass:true,tiltLatched:false,x:'0.00',y:'0.00',w:'0.00',mode:'tilt',joyX:0,joyY:0,
+    sensor:'等待传感器',sensorDetail:'',useCompass:true,tiltLatched:false,grip:'left',details:false,x:'0.00',y:'0.00',w:'0.00',mode:'joystick',joyX:0,joyY:0,
     videoOn:false,videoFresh:false,frameSrc:'',frames:[],flipped:true,videoText:'画面已暂停',
     wifiText:'看画面请连接 Omni-Remote Wi-Fi',statusFresh:false,faceName:'等待小车状态',
     dizzy:0,fatigue:0,idle:0,manual:-1,fault:false,faceOptions:['自动情绪',...C.FACES],faceIndex:0},
@@ -60,6 +60,13 @@ Page({
     }});
   },
   retrySensors() { this.release();this.startSensors(); },
+  toggleDetails() { this.setData({details:!this.data.details}); },
+  changeGrip(e) {
+    const grip=e.currentTarget.dataset.grip;
+    if(!['left','right'].includes(grip)||grip===this.data.grip)return;
+    this.release();this.setData({grip,status:'握持方向已切换，请重新校准体感'});
+  },
+  onResize() { this.release();this.joyRect=null;this.setData({status:'显示尺寸已变化，请重新开始驾驶'}); },
   toggleCompass(e) { this.release();this.setData({useCompass:!!e.detail.value}); },
   sensorFail() { if(this.kind==='tilt')this.release();this.setData({sensor:'传感器不可用，可切换摇杆驾驶'}); },
   compassFresh() { return !!this.headingAt&&Date.now()-this.headingAt<1000; },
@@ -88,7 +95,7 @@ Page({
     if(this.statusAt&&Date.now()-this.statusAt>1500)this.setData({statusFresh:false});
     if(!fresh&&this.kind==='tilt') { if(this.held)this.release();return; }
     if(!this.held||!this.driver||!this.driver.active)return;
-    const v=this.kind==='tilt'?C.motion(this.sample,this.zero,this.usingCompass?this.heading:0,this.usingCompass?this.reference:0,this.scale):
+    const v=this.kind==='tilt'?C.motion(this.sample,this.zero,this.usingCompass?this.heading:0,this.usingCompass?this.reference:0,this.scale,this.data.grip):
       [this.joy[0]*0.12*this.scale,this.joy[1]*0.12*this.scale,0];
     const turns=Object.values(this.turnTouches);
     if(turns.length)v[2]=Math.max(-1,Math.min(1,turns.reduce((a,b)=>a+b,0)))*0.60*this.scale;
@@ -152,7 +159,8 @@ Page({
     let x=(t.clientX-r.left-r.width/2)/(r.width/2),y=-(t.clientY-r.top-r.height/2)/(r.height/2);
     const length=Math.hypot(x,y);if(length>1) { x/=length;y/=length; }
     this.joy=length<0.08?[0,0]:[x,y];
-    this.setData({joyX:this.joy[0]*65,joyY:-this.joy[1]*65});
+    const travel=Math.min(r.width,r.height)*0.32;
+    this.setData({joyX:this.joy[0]*travel,joyY:-this.joy[1]*travel});
   },
   joyMove(e) { const t=e.touches.find(t=>t.identifier===this.joyTouch);if(t)this.moveJoy(t); },
   joyEnd(e) {
@@ -249,7 +257,7 @@ Page({
       const characteristic=characteristics.find(c=>C.normalize(c.uuid)===C.normalize(C.WRITE)&&c.properties.write);
       if(!characteristic)throw new Error('未找到带响应写特征值');
       const status=characteristics.find(c=>C.normalize(c.uuid)===C.normalize(C.STATUS)&&c.properties.notify);
-      if(!status)throw new Error('请先烧录集成版固件：缺少奶蛙状态服务');
+      if(!status)throw new Error('请先烧录集成版固件：缺少小车状态服务');
       const characteristicId=characteristic.uuid;
       await call('notifyBLECharacteristicValueChange',{deviceId,serviceId,characteristicId:status.uuid,state:true});current();
       this.driver=new C.Driver((text,done)=>wx.writeBLECharacteristicValue({
