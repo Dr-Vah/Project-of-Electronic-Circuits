@@ -13,6 +13,7 @@
 #include "usb/uvc_host.h"
 #include "fpv.h"
 #include "local_tls.h"
+#include "fpv_tcp.h"
 
 #define JPEG_CAP (128*1024)
 static uint8_t *latest,*snapshot;
@@ -24,6 +25,18 @@ static SemaphoreHandle_t send_lock;
 static QueueHandle_t connections;
 static TaskHandle_t owner_task;
 static const char *TAG="fpv";
+
+bool fpv_copy_frame(uint8_t *out,size_t cap,size_t *len,uint32_t *seq,uint32_t *age_ms) {
+    *len=0;*seq=0;*age_ms=0;
+    if(!lock||!out)return false;
+    xSemaphoreTake(lock,portMAX_DELAY);
+    int64_t age=esp_timer_get_time()-jpeg_time;
+    if(jpeg_size && jpeg_size<=cap && age>=0 && age<1000000) {
+        memcpy(out,latest,jpeg_size);*len=jpeg_size;*seq=jpeg_sequence;*age_ms=(uint32_t)(age/1000);
+    }
+    xSemaphoreGive(lock);
+    return *len>0;
+}
 
 /* Driver keeps frame ownership. Drop rather than wait on HTTP copy. */
 static bool frame_cb(const uvc_host_frame_t *f,void *ctx) {
@@ -73,10 +86,14 @@ static void camera_owner(void *arg) {
             .usb={.dev_addr=address,.vid=UVC_HOST_ANY_VID,.pid=UVC_HOST_ANY_PID,.uvc_stream_index=index},
             .vs_format={.h_res=m[best].h_res,.v_res=m[best].v_res,.fps=interval?10000000.0f/interval:0,.format=UVC_VS_FORMAT_MJPEG},
             .advanced={.number_of_frame_buffers=3,.frame_size=JPEG_CAP,
-                .frame_heap_caps=MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT,.number_of_urbs=3,.urb_size=10*1024}};
+                .frame_heap_caps=MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT,.number_of_urbs=3,.urb_size=2*1024}};
         free(m);
         ulTaskNotifyTake(pdTRUE,0);
         uvc_host_stream_hdl_t stream=NULL;
+        ESP_LOGI(TAG,"Opening camera %ux%u %.1f fps; internal DMA free=%u largest=%u",
+            config.vs_format.h_res,config.vs_format.v_res,config.vs_format.fps,
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA));
         esp_err_t err=uvc_host_stream_open(&config,pdMS_TO_TICKS(5000),&stream);
         if(err==ESP_OK)err=uvc_host_stream_start(stream);
         if(err==ESP_OK) {
@@ -143,5 +160,9 @@ esp_err_t fpv_start(void) {
     if(xTaskCreate(camera_owner,"uvc_owner",4096,NULL,3,&owner_task)!=pdPASS)return ESP_ERR_NO_MEM;
     const uvc_host_driver_config_t driver={.driver_task_stack_size=4096,.driver_task_priority=4,
         .xCoreID=tskNO_AFFINITY,.create_background_task=true,.event_cb=driver_event};
-    return uvc_host_install(&driver);
+    err=uvc_host_install(&driver);
+    if(err!=ESP_OK)return err;
+    err=fpv_tcp_start();
+    if(err!=ESP_OK)ESP_LOGW(TAG,"Mini program video unavailable: %s",esp_err_to_name(err));
+    return ESP_OK;
 }
