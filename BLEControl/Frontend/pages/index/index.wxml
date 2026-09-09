@@ -1,0 +1,20 @@
+<!--index.wxml-->
+<view class="container">
+  <text class="title">ESP32 全向车体感遥控</text>
+
+  <!-- 蓝牙状态显示 -->
+  <text class="status">状态: {{statusText}}</text>
+  <button type="primary" bindtap="startConnect" disabled="{{connecting}}">搜索并连接小车</button>
+  <button class="disconnect" bindtap="disconnect" disabled="{{!deviceId}}">断开连接</button>
+  <button class="zero" bindtap="zeroHeading">归零方向</button>
+
+  <!-- 传感器数据显示 -->
+  <view class="data-box">
+    <text class="data-label">X轴倾斜 (左右): {{x_val}}</text>
+    <text class="data-label">Y轴倾斜 (前后): {{y_val}}</text>
+    <text class="data-label">方向角 (0~360°): {{heading_val}}°</text>
+    <text class="data-label">旋转速度: {{w_val}}</text>
+  </view>
+
+  <text class="hint">倾斜手机控制平移；水平转动手机控制旋转，点「归零方向」锁定正前方</text>
+</view>

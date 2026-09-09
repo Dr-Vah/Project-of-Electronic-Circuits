@@ -345,6 +345,10 @@ static void uvc_transfers_free(uvc_stream_t *uvc_stream)
         usb_host_transfer_free(uvc_stream->constant.xfers[i]);
     }
     free(uvc_stream->constant.xfers);
+    /* Allocation rollback is followed by uvc_device_remove(), which calls
+     * this cleanup again. Never leave the freed array/count reachable. */
+    uvc_stream->constant.xfers = NULL;
+    uvc_stream->constant.num_of_xfers = 0;
 }
 
 /**

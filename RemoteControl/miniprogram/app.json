@@ -1,0 +1,5 @@
+{
+  "pages": ["pages/index/index"],
+  "window": {"navigationBarTitleText": "奶蛙 · BLE 体感", "navigationBarBackgroundColor": "#eef5ef"},
+  "style": "v2"
+}

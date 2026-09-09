@@ -20,11 +20,15 @@
 #include "mood.h"
 #include "fpv.h"
 #include "local_tls.h"
+#include "ble_remote.h"
+#include "remote_ble_state.h"
 
 /* Conservative initial limits; chassis +x right, +y IR-facing front. */
-#define MAX_TRANSLATION 0.12f
-#define MAX_ROTATION 0.60f
+#define MAX_TRANSLATION REMOTE_MAX_TRANSLATION
+#define MAX_ROTATION REMOTE_MAX_ROTATION
 static remote_state_t state;
+static uint32_t ble_token;
+static bool ble_connected;
 static SemaphoreHandle_t mutex;
 static int manual_face=FACE_AUTO;
 static bool link_fault=false;
@@ -33,6 +37,36 @@ static uint16_t face_frame[128*160];
 static mood_t mood;
 extern const char page_start[] asm("_binary_index_html_start");
 extern const char page_end[] asm("_binary_index_html_end");
+
+/* HTTP and BLE share the same lease, motor task, limits and watchdog. */
+static bool ble_command(ble_command_t c) {
+    uint32_t candidate=esp_random();if(!candidate)candidate=1;
+    xSemaphoreTake(mutex,portMAX_DELAY);
+    bool ok=remote_ble_apply(&state,&ble_token,&manual_face,&link_fault,c,esp_timer_get_time(),candidate);
+    xSemaphoreGive(mutex);
+    return ok;
+}
+static void ble_status(uint8_t out[BLE_STATUS_SIZE]) {
+    xSemaphoreTake(mutex,portMAX_DELAY);
+    bool moving=state.token&&(state.x!=0||state.y!=0||state.turn!=0);
+    out[0]=1;
+    out[1]=(uint8_t)fminf(100,fmaxf(0,mood.dizzy));
+    out[2]=(uint8_t)fminf(100,fmaxf(0,mood.fatigue));
+    out[3]=(uint8_t)fminf(255,fmaxf(0,mood.idle));
+    out[4]=(uint8_t)mood_face(&mood,manual_face,link_fault,moving);
+    out[5]=(uint8_t)(manual_face+1);
+    out[6]=link_fault;
+    out[7]=ble_token && state.token==ble_token;
+    xSemaphoreGive(mutex);
+}
+static void ble_link(bool connected) {
+    xSemaphoreTake(mutex,portMAX_DELAY);
+    ble_connected=connected;
+    if(!connected) {
+        remote_ble_disconnect(&state,&ble_token,&link_fault);
+    }
+    xSemaphoreGive(mutex);
+}
 
 static float approach(float a, float b, float step) {
     return a + fmaxf(-step, fminf(step, b-a));
@@ -73,7 +107,7 @@ static void display_task(void *arg) {
     while(true) {
         xSemaphoreTake(mutex,portMAX_DELAY);
         int face=mood_face(&mood,manual_face,link_fault,state.token&&(state.x!=0||state.y!=0||state.turn!=0));
-        bool linked=station_count>0&&!link_fault;
+        bool linked=(station_count>0||ble_connected)&&!link_fault;
         xSemaphoreGive(mutex);
         /* Slow idle breathing, livelier driving/laughter. No heap allocation. */
         unsigned interval=(face==FACE_SLEEP?1100:face==FACE_LAUGH||face==FACE_DIZZY?350:650);
@@ -141,7 +175,7 @@ static esp_err_t api(httpd_req_t *r) {
     remote_expire(&state,now);
     if(previous_token&&!state.token)link_fault=true;
     if (!strcmp(r->uri,"/api/stop")) {
-        remote_stop(&state); ok=true;
+        remote_stop(&state); ble_token=0; ok=true;
     } else if (!strcmp(r->uri,"/api/emoji")) {
         double f,t=0;
         number(j,"token",&t);
@@ -152,7 +186,7 @@ static esp_err_t api(httpd_req_t *r) {
     } else if (!strcmp(r->uri,"/api/claim")) {
         token=esp_random(); if(!token) token=1;
         ok=remote_claim(&state,token,now);
-        if(ok)link_fault=false;
+        if(ok) { link_fault=false;ble_token=0; }
     } else {
         double t,q,x,y,w;
         if(number(j,"token",&t)&&number(j,"seq",&q)&&number(j,"x",&x)&&number(j,"y",&y)&&number(j,"turn",&w)
@@ -191,6 +225,8 @@ void app_main(void) {
         ESP_ERROR_CHECK(nvs_flash_erase()); e=nvs_flash_init();
     }
     ESP_ERROR_CHECK(e);
+    esp_err_t ble_err=ble_remote_start(ble_command,ble_link,ble_status);
+    if(ble_err!=ESP_OK) ESP_LOGW("remote","BLE unavailable: %s",esp_err_to_name(ble_err));
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();

@@ -1,0 +1,61 @@
+/**index.wxss**/
+.container {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 120rpx 60rpx;
+  box-sizing: border-box;
+}
+
+.title {
+  font-size: 44rpx;
+  font-weight: 600;
+  color: #1a1a1a;
+  margin-bottom: 80rpx;
+}
+
+.status {
+  font-size: 32rpx;
+  color: #666;
+  margin-bottom: 40rpx;
+}
+
+button {
+  width: 70%;
+  margin-top: 24rpx;
+}
+
+.disconnect {
+  background-color: #ffffff;
+  color: #333;
+  border: 1rpx solid #d9d9d9;
+}
+
+.zero {
+  background-color: #f7f7f7;
+  color: #333;
+  border: 1rpx solid #d9d9d9;
+}
+
+.data-box {
+  width: 100%;
+  margin-top: 100rpx;
+  padding: 40rpx;
+  background-color: #ffffff;
+  border-radius: 16rpx;
+  display: flex;
+  flex-direction: column;
+}
+
+.data-label {
+  font-size: 36rpx;
+  color: #1a1a1a;
+  margin: 20rpx 0;
+}
+
+.hint {
+  margin-top: 60rpx;
+  font-size: 26rpx;
+  color: #999;
+}
