@@ -19,8 +19,11 @@
 
 #include "black_target_detector.h"
 #include "ball_transport_controller.h"
-#include "orange_ball_detector.h"
+#include "ball_target_detector.h"
 #include "tft_display.h"
+
+/* TFT is reserved for the wheel-speed/distance monitor in both missions. */
+#define CAMERA_TFT_PREVIEW_ENABLED 0
 #include "white_ball_detector.h"
 
 #define TAG "camera_line"
@@ -29,8 +32,8 @@
 #define FRAME_BUFFER_COUNT 3
 #define MIN_MJPEG_BUFFER_SIZE (40U * 1024U)
 #define JPEG_WORK_BUFFER_SIZE 4096U
-#define CAMERA_DECODE_MAX_WIDTH WHITE_BALL_MAX_WIDTH
-#define CAMERA_DECODE_MAX_HEIGHT WHITE_BALL_MAX_HEIGHT
+#define CAMERA_DECODE_MAX_WIDTH 320U
+#define CAMERA_DECODE_MAX_HEIGHT 240U
 
 /* Keep these equal to the calibrated Camera_Display values. */
 #define LINE_BINARY_THRESHOLD 125U
@@ -87,6 +90,53 @@ static void rotate_ball_result_180(white_ball_result_t *ball,
     ball->center_y = 1.0f - ball->center_y;
 }
 
+/* Keep the controller/display in its original 180-degree-rotated frame.
+ * BallDet v2 runs on the unrotated camera image, including its left target. */
+static white_ball_result_t adapt_bt_ball(const bt_ball_t *ball, bool valid,
+                                        uint16_t width, uint16_t height,
+                                        float diameter_scale)
+{
+    white_ball_result_t result = {0};
+    if (!valid) return result;
+    const uint32_t area = (314U * ball->radius * ball->radius + 50U) / 100U;
+    result.valid = true;
+    result.confirmation_count = 1;
+    result.area_px = area > UINT16_MAX ? UINT16_MAX : (uint16_t)area;
+    result.left = ball->x > ball->radius ? ball->x - ball->radius : 0;
+    result.top = ball->y > ball->radius ? ball->y - ball->radius : 0;
+    result.right = (uint32_t)ball->x + ball->radius < width
+        ? ball->x + ball->radius : width - 1U;
+    result.bottom = (uint32_t)ball->y + ball->radius < height
+        ? ball->y + ball->radius : height - 1U;
+    result.center_x = 2.0f * ball->x / (width - 1U) - 1.0f;
+    result.center_y = (float)ball->y / (height - 1U);
+    /* Preserve the controller's existing pixel-diameter capture thresholds. */
+    result.diameter_px = 2.0f * ball->radius * diameter_scale;
+    rotate_ball_result_180(&result, width, height);
+    return result;
+}
+
+static black_target_result_t adapt_bt_target(const bt_target_t *target,
+                                             bool valid, uint16_t width,
+                                             uint16_t height)
+{
+    black_target_result_t result = {0};
+    if (!valid) return result;
+    result.valid = true;
+    result.confirmation_count = 1;
+    result.area_px = target->area > UINT16_MAX
+        ? UINT16_MAX : (uint16_t)target->area;
+    /* BallDet v2's x1/y1 are exclusive; controller bounds are inclusive. */
+    result.left = width - target->x1;
+    result.right = width - 1U - target->x0;
+    result.top = height - target->y1;
+    result.bottom = height - 1U - target->y0;
+    result.center_x = 1.0f - 2.0f * target->x / (width - 1U);
+    result.center_y = 1.0f - (float)target->y / (height - 1U);
+    result.area_fraction = (float)target->area / ((uint32_t)width * height);
+    return result;
+}
+
 static float interval_to_fps(uint32_t interval)
 {
     return interval ? 10000000.0f / (float)interval : 0.0f;
@@ -105,9 +155,25 @@ static uint32_t slowest_interval(const uvc_host_frame_info_t *info)
     return selected;
 }
 
+static esp_jpeg_image_scale_t choose_legacy_decode_scale(
+    const uvc_host_stream_format_t *format)
+{
+    if ((format->h_res + 1U) / 2U <= WHITE_BALL_MAX_WIDTH &&
+        (format->v_res + 1U) / 2U <= WHITE_BALL_MAX_HEIGHT) {
+        return JPEG_IMAGE_SCALE_1_2;
+    }
+    if ((format->h_res + 3U) / 4U <= WHITE_BALL_MAX_WIDTH &&
+        (format->v_res + 3U) / 4U <= WHITE_BALL_MAX_HEIGHT) {
+        return JPEG_IMAGE_SCALE_1_4;
+    }
+    return JPEG_IMAGE_SCALE_1_8;
+}
+
 static esp_jpeg_image_scale_t choose_decode_scale(
     const uvc_host_stream_format_t *format)
 {
+    if (format->h_res <= CAMERA_DECODE_MAX_WIDTH &&
+        format->v_res <= CAMERA_DECODE_MAX_HEIGHT) return JPEG_IMAGE_SCALE_0;
     if ((format->h_res + 1U) / 2U <= CAMERA_DECODE_MAX_WIDTH &&
         (format->v_res + 1U) / 2U <= CAMERA_DECODE_MAX_HEIGHT) {
         return JPEG_IMAGE_SCALE_1_2;
@@ -265,14 +331,30 @@ static void analyse_rgb565(uint16_t *pixels, uint16_t width, uint16_t height)
             }
         }
     }
+    /* Actual centroid ROI: trim 20% off each side of the four-channel strip.
+     * Cyan bounds, magenta reference axis, red measured line centroid. */
+    draw_detection_box(pixels, width, height, cx0, y0, cx1 - 1U,
+                       y1 - 1U, 0x07FF);
+    const unsigned axis_x = (cx0 + cx1) / 2U;
+    for (unsigned y = y0; y < height / 3U; ++y) {
+        set_wire_pixel(pixels, width, height, axis_x, y, 0xF81F);
+    }
+    if (line_dark != 0) {
+        const unsigned measured_x = line_x_sum / line_dark;
+        for (unsigned y = y0; y < height / 5U; ++y) {
+            set_wire_pixel(pixels, width, height, measured_x, y, 0xF800);
+        }
+    }
     /* Throttle the debug display so the vision pipeline is not blocked on the
      * slow SPI framebuffer write every frame.  The display stays at a small,
      * fixed refresh rate while decoding and state updates run at full speed. */
     const int64_t now_us = esp_timer_get_time();
     if (now_us - s_last_display_us >= CAMERA_DISPLAY_PERIOD_US) {
         s_last_display_us = now_us;
-        ESP_ERROR_CHECK_WITHOUT_ABORT(tft_display_show_camera_debug(
+        if (CAMERA_TFT_PREVIEW_ENABLED) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(tft_display_show_camera_debug(
             pixels, width, height, next.dark_percent, next.black));
+        }
     }
 }
 
@@ -289,33 +371,10 @@ static void frame_task(void *arg)
     (void)arg;
     uint16_t *framebuffer = heap_caps_malloc(CAMERA_DECODE_MAX_WIDTH * CAMERA_DECODE_MAX_HEIGHT * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     uint8_t *work = heap_caps_malloc(JPEG_WORK_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    white_ball_detector_t *white_detector = heap_caps_calloc(
-        1U, sizeof(*white_detector), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    orange_ball_detector_t *orange_detector = heap_caps_calloc(
-        1U, sizeof(*orange_detector), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    black_target_detector_t *target_detectors = heap_caps_calloc(
-        2U, sizeof(*target_detectors), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(framebuffer && work && white_detector && orange_detector &&
-           target_detectors);
-
-    white_ball_config_t white_config;
-    white_ball_default_config(&white_config);
-    assert(white_ball_detector_init(white_detector, &white_config));
-    orange_ball_config_t orange_config;
-    orange_ball_default_config(&orange_config);
-    assert(orange_ball_detector_init(orange_detector, &orange_config));
-    black_target_config_t target_config;
-    black_target_default_config(&target_config);
-    assert(black_target_detector_init(
-        &target_detectors[BALL_COLOR_WHITE], &target_config));
-    assert(black_target_detector_init(
-        &target_detectors[BALL_COLOR_ORANGE], &target_config));
-
+    assert(framebuffer && work);
+    bt_detector_t detector;
+    bt_detector_init(&detector);
     ball_color_t previous_color = BALL_COLOR_WHITE;
-    bool have_ball_anchor[2] = {false, false};
-    float ball_anchor_x[2] = {0.0f, 0.0f};
-    float ball_anchor_y[2] = {0.0f, 0.0f};
-    bool target_label_announced[2] = {false, false};
     int64_t next_ball_log_us = 0;
     for (;;) {
         uvc_host_frame_t *frame = NULL;
@@ -341,92 +400,74 @@ static void frame_task(void *arg)
             if (!ball_mode) {
                 analyse_rgb565(framebuffer, output.width, output.height);
             } else {
-                white_ball_result_t balls[2] = {0};
-                black_target_result_t targets[2] = {0};
                 const ball_color_t active_color =
                     ball_transport_controller_requested_color();
                 if (active_color != previous_color) {
                     previous_color = active_color;
+                    /* Reacquire the target for the new delivery leg. */
+                    detector.target_has_candidate = false;
+                    detector.target_valid = false;
+                    detector.target_consecutive_frames = 0;
                     ESP_LOGI(TAG, "vision switched to orange ball");
                 }
-
-                bool detection_ok[2] = {true, true};
-                if (active_color == BALL_COLOR_WHITE) {
-                    detection_ok[BALL_COLOR_WHITE] =
-                        white_ball_detect_rgb565(
-                            white_detector, framebuffer, output.width,
-                            output.height, &balls[BALL_COLOR_WHITE]);
-                    detection_ok[BALL_COLOR_ORANGE] =
-                        orange_ball_detect_rgb565(
-                            orange_detector, framebuffer, output.width,
-                            output.height, &balls[BALL_COLOR_ORANGE]);
-                } else {
-                    detection_ok[BALL_COLOR_ORANGE] =
-                        orange_ball_detect_rgb565(
-                            orange_detector, framebuffer, output.width,
-                            output.height, &balls[BALL_COLOR_ORANGE]);
-                }
-
+                bt_detector_result_t detection = {0};
+                /* The controller requests orange only after white delivery
+                 * and back-away finish. Reapply after any detector reset. */
+                detector.white_delivery_complete =
+                    active_color == BALL_COLOR_ORANGE;
+                const esp_err_t detection_error = bt_detector_process_rgb565(
+                    &detector, framebuffer, output.width, output.height,
+                    &detection);
+                const unsigned legacy_divisor =
+                    1U << choose_legacy_decode_scale(&frame->vs_format);
+                const unsigned legacy_width =
+                    (frame->vs_format.h_res + legacy_divisor - 1U) /
+                    legacy_divisor;
+                const float diameter_scale = (float)legacy_width / output.width;
+                const bool detection_ok = detection_error == ESP_OK;
+                const bt_ball_t *selected = active_color == BALL_COLOR_WHITE
+                    ? &detection.ball : &detection.orange_ball;
+                const bool ball_valid = active_color == BALL_COLOR_WHITE
+                    ? detection.ball_valid : detection.orange_ball_valid;
+                white_ball_result_t ball = adapt_bt_ball(
+                    selected, detection_ok && ball_valid, output.width,
+                    output.height, diameter_scale);
+                black_target_result_t target = adapt_bt_target(
+                    &detection.target, detection_ok && detection.target_valid,
+                    output.width, output.height);
                 rotate_frame_180(framebuffer, output.width, output.height);
-                rotate_ball_result_180(&balls[BALL_COLOR_WHITE],
-                                       output.width, output.height);
-                rotate_ball_result_180(&balls[BALL_COLOR_ORANGE],
-                                       output.width, output.height);
-
-                const bool map_both_targets =
-                    active_color == BALL_COLOR_WHITE;
-                for (int color = BALL_COLOR_WHITE;
-                     color <= BALL_COLOR_ORANGE; ++color) {
-                    if (!detection_ok[color] ||
-                        (!map_both_targets && color != active_color)) {
-                        continue;
-                    }
-                    if (balls[color].valid) {
-                        have_ball_anchor[color] = true;
-                        ball_anchor_x[color] = balls[color].center_x;
-                        ball_anchor_y[color] = balls[color].center_y;
-                    }
-                    if (have_ball_anchor[color]) {
-                        black_target_detect_rgb565(
-                            &target_detectors[color], framebuffer,
-                            output.width, output.height,
-                            ball_anchor_x[color], ball_anchor_y[color],
-                            &targets[color]);
-                    }
-                    if (targets[color].valid &&
-                        !target_label_announced[color]) {
-                        target_label_announced[color] = true;
-                        ESP_LOGI(TAG, "target labelled for %s ball",
-                                 color == BALL_COLOR_WHITE
-                                     ? "white" : "orange");
-                    }
-                }
-
-                white_ball_result_t ball = balls[active_color];
-                black_target_result_t target = targets[active_color];
-                if (active_color == BALL_COLOR_WHITE &&
-                    !(target_label_announced[BALL_COLOR_WHITE] &&
-                      target_label_announced[BALL_COLOR_ORANGE])) {
-                    memset(&target, 0, sizeof(target));
-                }
-                if (detection_ok[active_color]) {
+                {
                     const int64_t now_us = esp_timer_get_time();
                     ball_transport_controller_submit(
                         &ball, &target, active_color, output.width,
-                        output.height, now_us);
+                        output.height, now_us, detection.black_ahead);
                     if (now_us >= next_ball_log_us) {
                         next_ball_log_us = now_us + 1500000LL;
                         ESP_LOGI(TAG,
                                  "%s ball=%d center=(%+.2f,%+.2f) "
-                                 "target=%d center=(%+.2f,%+.2f)",
+                                 "target=%d center=(%+.2f,%+.2f) "
+                                 "bottom=%.2f box=%ux%u left_mask=%d "
+                                 "black_ahead=%d dark=%u%%",
                                  active_color == BALL_COLOR_WHITE
                                      ? "white" : "orange",
                                  ball.valid, ball.center_x, ball.center_y,
                                  target.valid, target.center_x,
-                                 target.center_y);
+                                 target.center_y,
+                                 target.valid ? (float)(target.bottom + 1U) /
+                                     output.height : 0.0f,
+                                 target.valid ? (unsigned)(target.right - target.left + 1U) : 0U,
+                                 target.valid ? (unsigned)(target.bottom - target.top + 1U) : 0U,
+                                 detector.white_left_mask_active,
+                                 detection.black_ahead,
+                                 (unsigned)detection.black_ahead_percent);
                     }
-                } else {
-                    ESP_LOGW(TAG, "WhiteBallDetection detector failed");
+                }
+                if (!detection_ok) {
+                    const bool keep_left_mask = detector.white_left_mask_active;
+                    bt_detector_init(&detector);
+                    detector.white_left_mask_active = keep_left_mask;
+                    ESP_LOGW(TAG, "BallDet v2 failed: %s",
+                             esp_err_to_name(detection_error));
                 }
 
                 if (ball.valid) {
@@ -445,9 +486,11 @@ static void frame_task(void *arg)
                 if (display_us - s_last_display_us >=
                     CAMERA_DISPLAY_PERIOD_US) {
                     s_last_display_us = display_us;
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(
+                    if (CAMERA_TFT_PREVIEW_ENABLED) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
                         tft_display_show_camera_frame(
                             framebuffer, output.width, output.height));
+        }
                 }
             }
         }
@@ -549,5 +592,5 @@ void camera_line_sensor_enable_ball_mode(void)
     s_ball_mode = true;
     portEXIT_CRITICAL(&s_state_lock);
     ESP_LOGI(TAG, "camera pipeline switched from line tracking to "
-                 "WhiteBallDetection");
+                 "BallDet v2");
 }

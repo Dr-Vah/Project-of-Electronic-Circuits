@@ -16,16 +16,19 @@
 #define CONTROL_PERIOD_MS 20
 #define VISION_STALE_MS 2000
 #define REQUIRED_STABLE_FRAMES 2U
+#define ALIGN_DEVIATION_CONFIRM_FRAMES 3U
 #define LOST_VISION_LIMIT 5U
 
-#define STAGING_STRAFE_GAIN 0.045f
+#define STAGING_STRAFE_PULSE_MPS 0.065f
+#define PUSH_ALIGN_PULSE_RAD_S 0.28f
 /* BallDet is more selective but takes longer per frame. Keep chassis motion
  * conservative so one detection interval cannot create a large overshoot. */
-#define ALIGN_TURN_GAIN 0.30f
-#define MAX_STAGING_STRAFE_MPS 0.020f
-#define NEAR_LINE_TURN_PULSE_RAD_S 0.35f
-#define NEAR_LINE_TURN_PULSE_MS 55
+#define ALIGN_TURN_GAIN 0.35f
+#define STAGING_STRAFE_PULSE_MS 80
+#define NEAR_LINE_TURN_PULSE_RAD_S 0.28f
+#define NEAR_LINE_TURN_PULSE_MS 40
 #define LINE_BOTTOM_TOLERANCE 0.055f
+#define LINE_BOTTOM_STOP_LEFT_ERROR (-0.025f)
 #define LINE_BOTTOM_RECHECK_TOLERANCE 0.10f
 #define APPROACH_SPEED_MPS 0.030f
 #define PUSH_SPEED_MPS 0.045f
@@ -33,7 +36,12 @@
 #define BACK_AWAY_SPEED_MPS 0.030f
 /* Keep rotation below the amount that can move a locked ball/target outside
  * its local tracking window between two camera results. */
-#define ORANGE_SEARCH_TURN_RAD_S 0.30f
+#define ORANGE_SEARCH_TURN_RAD_S 0.18f
+/* Timed trims: 0.025 m/s * 0.8 s = 2 cm; +0.18 rad/s * 2.9 s ~= 30 deg left. */
+#define WHITE_EXTRA_PUSH_SPEED_MPS 0.025f
+#define WHITE_EXTRA_PUSH_MS 800
+#define ORANGE_PRETURN_LEFT_RAD_S 0.18f
+#define ORANGE_PRETURN_LEFT_MS 2900
 
 #define BALL_TARGET_ALIGNMENT_TOLERANCE 0.070f
 #define PUSH_AXIS_TOLERANCE 0.055f
@@ -44,15 +52,14 @@
 #define APPROACH_DROPOUT_GRACE_MS 1500
 #define COMMITTED_DRIVE_TIMEOUT_MS 12000
 #define BLIND_CAPTURE_MS 500
-#define TARGET_VISIBLE_STOP_BOTTOM_FRACTION 0.84f
-#define TARGET_SLOWDOWN_BOTTOM_FRACTION 0.60f
+#define TARGET_SLOWDOWN_BOTTOM_FRACTION 0.45f
 #define RELEASE_SETTLE_MS 300
 /* With the encoder-controlled 0.03 m/s reverse command, 8.35 s is about
  * 0.25 m. Only the white-ball leg needs this clearance before turning
  * toward the orange ball; the final release remains short. */
 #define WHITE_BACK_AWAY_MS 8350
 #define FINAL_BACK_AWAY_MS 900
-#define ORANGE_SEARCH_TIMEOUT_MS 8000
+#define ORANGE_SEARCH_TIMEOUT_MS 14000
 
 static const char *TAG = "ball_transport";
 static portMUX_TYPE s_vision_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -64,8 +71,10 @@ typedef enum {
     TRANSPORT_APPROACH_BALL,
     TRANSPORT_ALIGN_PUSH,
     TRANSPORT_STRAIGHT_PUSH,
+    TRANSPORT_WHITE_EXTRA_PUSH,
     TRANSPORT_SETTLE,
     TRANSPORT_BACK_AWAY,
+    TRANSPORT_PRETURN_ORANGE,
     TRANSPORT_TURN_TO_ORANGE,
     TRANSPORT_FINISHED,
     TRANSPORT_FAULT,
@@ -79,6 +88,7 @@ typedef struct {
     int64_t timestamp_us;
     uint32_t sequence;
     ball_color_t ball_color;
+    bool black_ahead;
 } transport_vision_t;
 
 typedef struct {
@@ -86,6 +96,7 @@ typedef struct {
     uint32_t last_sequence;
     uint8_t stable_frames;
     uint8_t lost_frames;
+    uint8_t align_deviation_frames;
     int64_t phase_deadline_us;
     int64_t next_log_us;
     bool near_ball_seen;
@@ -98,11 +109,6 @@ typedef struct {
 
 static transport_vision_t s_vision;
 static volatile ball_color_t s_requested_color = BALL_COLOR_WHITE;
-
-static float clampf(float value, float low, float high)
-{
-    return value < low ? low : (value > high ? high : value);
-}
 
 static float chassis_push_axis_error(float image_center_x)
 {
@@ -118,8 +124,10 @@ static const char *state_name(transport_state_t state)
     case TRANSPORT_APPROACH_BALL: return "APPROACH_BALL";
     case TRANSPORT_ALIGN_PUSH: return "ALIGN_PUSH";
     case TRANSPORT_STRAIGHT_PUSH: return "STRAIGHT_PUSH";
+    case TRANSPORT_WHITE_EXTRA_PUSH: return "WHITE_EXTRA_PUSH";
     case TRANSPORT_SETTLE: return "SETTLE";
     case TRANSPORT_BACK_AWAY: return "BACK_AWAY";
+    case TRANSPORT_PRETURN_ORANGE: return "PRETURN_ORANGE";
     case TRANSPORT_TURN_TO_ORANGE: return "TURN_TO_ORANGE";
     case TRANSPORT_FINISHED: return "FINISHED";
     case TRANSPORT_FAULT: return "FAULT";
@@ -141,6 +149,7 @@ static void enter_state(transport_context_t *context,
     context->state = state;
     context->stable_frames = 0U;
     context->lost_frames = 0U;
+    context->align_deviation_frames = 0U;
     context->near_ball_seen = false;
     context->blind_capture_deadline_us = 0;
     context->approach_dropout_deadline_us = 0;
@@ -160,7 +169,8 @@ void ball_transport_controller_submit(const white_ball_result_t *ball,
                                       ball_color_t ball_color,
                                       size_t frame_width,
                                       size_t frame_height,
-                                      int64_t timestamp_us)
+                                      int64_t timestamp_us,
+                                      bool black_ahead)
 {
     if (ball == NULL || target == NULL || frame_width == 0U ||
         frame_height == 0U) {
@@ -170,6 +180,7 @@ void ball_transport_controller_submit(const white_ball_result_t *ball,
     s_vision.ball = *ball;
     s_vision.target = *target;
     s_vision.ball_color = ball_color;
+    s_vision.black_ahead = black_ahead;
     s_vision.width = frame_width;
     s_vision.height = frame_height;
     s_vision.timestamp_us = timestamp_us;
@@ -192,20 +203,6 @@ static bool staging_scene_is_valid(const transport_vision_t *vision)
            vision->target.center_y + 0.04f < vision->ball.center_y;
 }
 
-static bool ball_overlaps_target(const transport_vision_t *vision)
-{
-    const white_ball_result_t *ball = &vision->ball;
-    const black_target_result_t *target = &vision->target;
-    if (!ball->valid || !target->valid) return false;
-
-    const bool horizontal_overlap =
-        ball->right >= target->left && ball->left <= target->right;
-    const bool vertical_overlap =
-        ball->bottom >= target->top && ball->top <= target->bottom;
-    return horizontal_overlap && vertical_overlap &&
-           ball->center_y >= 0.60f;
-}
-
 static void apply_velocity(float vx, float vy, float omega)
 {
     ESP_ERROR_CHECK_WITHOUT_ABORT(car_control_set_velocity(vx, vy, omega));
@@ -220,6 +217,29 @@ static void update_on_new_frame(transport_context_t *context,
                                 const transport_vision_t *vision,
                                 int64_t now_us)
 {
+    /* Begin the final delivery action before any ball/target validity gate.
+     * White gets one timed trim; orange stops immediately. */
+    if (vision->black_ahead &&
+        (context->state == TRANSPORT_APPROACH_BALL ||
+         context->state == TRANSPORT_ALIGN_PUSH ||
+         context->state == TRANSPORT_STRAIGHT_PUSH)) {
+        if (context->active_color == BALL_COLOR_WHITE) {
+            ESP_LOGI(TAG, "black ahead; white extra push for %d ms", WHITE_EXTRA_PUSH_MS);
+            enter_state(context, TRANSPORT_WHITE_EXTRA_PUSH);
+            context->phase_deadline_us = now_us + WHITE_EXTRA_PUSH_MS * 1000LL;
+            apply_velocity(0.0f, WHITE_EXTRA_PUSH_SPEED_MPS, 0.0f);
+        } else {
+            ESP_LOGI(TAG, "black ahead; stop immediately");
+            stop_motors();
+            context->phase_deadline_us = now_us + RELEASE_SETTLE_MS * 1000LL;
+            enter_state(context, TRANSPORT_SETTLE);
+        }
+        return;
+    }
+    if (!vision->target.valid ||
+        (context->state != TRANSPORT_ALIGN_PUSH && !vision->ball.valid)) {
+        context->stable_frames = 0U;
+    }
     if (vision->target.valid && vision->height > 0U) {
         context->last_visible_target_bottom =
             (float)(vision->target.bottom + 1U) / (float)vision->height;
@@ -257,7 +277,7 @@ static void update_on_new_frame(transport_context_t *context,
              * confirmation while stationary. Continuing to turn for another
              * vision frame used to move the newly found ball too far away. */
             stop_motors();
-            if (++context->stable_frames >= REQUIRED_STABLE_FRAMES) {
+            if (++context->stable_frames >= 1U) {
                 ESP_LOGI(TAG,
                          "orange ball acquired and confirmed while stopped");
                 enter_state(context, TRANSPORT_WAIT_SCENE);
@@ -275,14 +295,15 @@ static void update_on_new_frame(transport_context_t *context,
         }
         stop_motors();
         if (staging_scene_is_valid(vision)) {
-            if (++context->stable_frames >= REQUIRED_STABLE_FRAMES) {
+            if (++context->stable_frames >= 1U) {
                 enter_state(context, TRANSPORT_STAGE_BEHIND_BALL);
             }
         } else {
             context->stable_frames = 0U;
+            break;
         }
-        break;
-
+        /* Use this first observation immediately for lateral alignment. */
+        __attribute__((fallthrough));
     case TRANSPORT_STAGE_BEHIND_BALL:
         if (!staging_scene_is_valid(vision)) {
             stop_motors();
@@ -292,38 +313,45 @@ static void update_on_new_frame(transport_context_t *context,
             break;
         }
         context->lost_frames = 0U;
-        if (fabsf(line_bottom_error) < LINE_BOTTOM_TOLERANCE) {
+        /* Stop early only inside the valid approach band. If the line is
+         * already farther left than the recheck band, keep issuing a reverse
+         * pulse so ALIGN_APPROACH cannot bounce back without movement. */
+        if (line_bottom_error <= LINE_BOTTOM_STOP_LEFT_ERROR &&
+            line_bottom_error >= -LINE_BOTTOM_RECHECK_TOLERANCE) {
             /* Phase 1: the chassis centre, ball and target are collinear.
              * Confirm while stopped, then proceed to rotation-only phase 2. */
             stop_motors();
-            if (++context->stable_frames >= REQUIRED_STABLE_FRAMES) {
+            if (++context->stable_frames >= 1U) {
                 enter_state(context, TRANSPORT_ALIGN_APPROACH);
             }
             break;
         }
         context->stable_frames = 0U;
-        /* Low-speed continuous translation: no forward motion or rotation,
-         * and no repeated kick/stop cycle. */
-        apply_velocity(
-            clampf(STAGING_STRAFE_GAIN * line_bottom_error,
-                   -MAX_STAGING_STRAFE_MPS, MAX_STAGING_STRAFE_MPS),
-            0.0f, 0.0f);
+        /* One slow lateral pulse per fresh camera frame. The control task
+         * stops it when the pulse expires and waits for the next detection. */
+        const float strafe = copysignf(STAGING_STRAFE_PULSE_MPS,
+                                       line_bottom_error);
+        context->turn_pulse_deadline_us =
+            now_us + STAGING_STRAFE_PULSE_MS * 1000LL;
+        apply_velocity(strafe, 0.0f, 0.0f);
         break;
 
     case TRANSPORT_ALIGN_APPROACH:
-        if (!staging_scene_is_valid(vision)) {
+        if (!staging_scene_is_valid(vision) ||
+            fabsf(line_bottom_error) > LINE_BOTTOM_RECHECK_TOLERANCE) {
+            /* Low-rate frames can briefly jump. Hold position and require
+             * several consecutive bad frames before reopening translation. */
+            if (context->align_deviation_frames < UINT8_MAX) {
+                ++context->align_deviation_frames;
+            }
             stop_motors();
-            enter_state(context, TRANSPORT_WAIT_SCENE);
+            if (context->align_deviation_frames >=
+                ALIGN_DEVIATION_CONFIRM_FRAMES) {
+                enter_state(context, TRANSPORT_STAGE_BEHIND_BALL);
+            }
             break;
         }
-        if (fabsf(line_bottom_error) > LINE_BOTTOM_RECHECK_TOLERANCE) {
-            /* Rotation should preserve the line through the chassis centre.
-             * If perspective/slip moves it away, redo translation before
-             * issuing any more turn commands. */
-            stop_motors();
-            enter_state(context, TRANSPORT_STAGE_BEHIND_BALL);
-            break;
-        }
+        context->align_deviation_frames = 0U;
         if (fabsf(common_heading) < PUSH_AXIS_TOLERANCE &&
             fabsf(separation) < BALL_TARGET_ALIGNMENT_TOLERANCE) {
             stop_motors();
@@ -337,8 +365,7 @@ static void update_on_new_frame(transport_context_t *context,
             context->stable_frames = 0U;
             const float turn_error = fabsf(common_heading) > 0.01f
                 ? common_heading : separation;
-            const float turn_omega =
-                -copysignf(NEAR_LINE_TURN_PULSE_RAD_S, turn_error);
+            const float turn_omega = -copysignf(0.28f, turn_error);
             if (context->turn_pulse_deadline_us == 0) {
                 context->turn_pulse_deadline_us =
                     now_us + NEAR_LINE_TURN_PULSE_MS * 1000LL;
@@ -419,8 +446,9 @@ static void update_on_new_frame(transport_context_t *context,
                                        ? common_heading
                                        : target_axis_error;
         if (fabsf(push_heading) < PUSH_AXIS_TOLERANCE) {
-            /* Alignment is actionable immediately: enter the push state and
-             * issue its velocity in this same control update. */
+            /* Confirm two fresh aligned frames while stationary. */
+            stop_motors();
+            if (++context->stable_frames < REQUIRED_STABLE_FRAMES) break;
             enter_state(context, TRANSPORT_STRAIGHT_PUSH);
             context->phase_deadline_us =
                 now_us + COMMITTED_DRIVE_TIMEOUT_MS * 1000LL;
@@ -428,8 +456,8 @@ static void update_on_new_frame(transport_context_t *context,
         } else {
             context->stable_frames = 0U;
             apply_velocity(0.0f, 0.0f,
-                           clampf(-ALIGN_TURN_GAIN * push_heading,
-                                  -0.15f, 0.15f));
+                           copysignf(-PUSH_ALIGN_PULSE_RAD_S, push_heading));
+            context->turn_pulse_deadline_us = now_us + 40000LL;
         }
         break;
 
@@ -453,24 +481,7 @@ static void update_on_new_frame(transport_context_t *context,
             break;
         }
         context->lost_frames = 0U;
-        if (ball_overlaps_target(vision)) {
-            ESP_LOGI(TAG, "ball reached target; stop immediately");
-            stop_motors();
-            context->phase_deadline_us =
-                now_us + RELEASE_SETTLE_MS * 1000LL;
-            enter_state(context, TRANSPORT_SETTLE);
-            break;
-        }
         const float target_bottom = context->last_visible_target_bottom;
-        if (target_bottom >= TARGET_VISIBLE_STOP_BOTTOM_FRACTION) {
-            ESP_LOGI(TAG,
-                     "target visible at frame bottom; stop push immediately");
-            stop_motors();
-            context->phase_deadline_us =
-                now_us + RELEASE_SETTLE_MS * 1000LL;
-            enter_state(context, TRANSPORT_SETTLE);
-            break;
-        }
         /* The deliberate zero lateral and angular commands make this the
          * straight portion of the run. Encoder PID holds each wheel speed. */
         apply_velocity(
@@ -481,11 +492,62 @@ static void update_on_new_frame(transport_context_t *context,
         break;
     }
 
+    case TRANSPORT_WHITE_EXTRA_PUSH:
+    case TRANSPORT_PRETURN_ORANGE:
     case TRANSPORT_SETTLE:
     case TRANSPORT_BACK_AWAY:
     case TRANSPORT_FINISHED:
     case TRANSPORT_FAULT:
         break;
+    }
+}
+
+/* Run every 20 ms, independently of the next camera frame. */
+static void update_delivery_timers(transport_context_t *context, int64_t now_us)
+{
+    if (context->state == TRANSPORT_WHITE_EXTRA_PUSH &&
+        now_us >= context->phase_deadline_us) {
+        stop_motors();
+        enter_state(context, TRANSPORT_SETTLE);
+        context->phase_deadline_us = now_us + RELEASE_SETTLE_MS * 1000LL;
+    } else if (context->state == TRANSPORT_SETTLE &&
+        now_us >= context->phase_deadline_us) {
+        apply_velocity(0.0f, -BACK_AWAY_SPEED_MPS, 0.0f);
+        const int back_away_ms =
+            context->active_color == BALL_COLOR_WHITE
+                ? WHITE_BACK_AWAY_MS : FINAL_BACK_AWAY_MS;
+        context->phase_deadline_us = now_us + back_away_ms * 1000LL;
+        ESP_LOGI(TAG, "back away for %d ms (%s leg)", back_away_ms,
+                 context->active_color == BALL_COLOR_WHITE
+                     ? "about 0.25 m" : "final release");
+        enter_state(context, TRANSPORT_BACK_AWAY);
+    } else if (context->state == TRANSPORT_BACK_AWAY &&
+               now_us >= context->phase_deadline_us) {
+        stop_motors();
+        if (context->active_color == BALL_COLOR_WHITE) {
+            context->active_color = BALL_COLOR_ORANGE;
+            s_requested_color = BALL_COLOR_ORANGE;
+            context->phase_deadline_us =
+                now_us + ORANGE_PRETURN_LEFT_MS * 1000LL;
+            enter_state(context, TRANSPORT_PRETURN_ORANGE);
+            apply_velocity(0.0f, 0.0f, ORANGE_PRETURN_LEFT_RAD_S);
+        } else {
+            enter_state(context, TRANSPORT_FINISHED);
+        }
+    } else if (context->state == TRANSPORT_PRETURN_ORANGE &&
+               now_us >= context->phase_deadline_us) {
+        stop_motors();
+        enter_state(context, TRANSPORT_TURN_TO_ORANGE);
+        context->phase_deadline_us = now_us + ORANGE_SEARCH_TIMEOUT_MS * 1000LL;
+        /* Wait for the next frame before resuming the ordinary search. */
+    } else if (context->state == TRANSPORT_TURN_TO_ORANGE &&
+               now_us >= context->phase_deadline_us) {
+        ESP_LOGE(TAG, "orange-ball search timed out");
+        stop_motors();
+        enter_state(context, TRANSPORT_FAULT);
+    } else if (context->state == TRANSPORT_FINISHED ||
+               context->state == TRANSPORT_FAULT) {
+        stop_motors();
     }
 }
 
@@ -504,7 +566,10 @@ static void controller_task(void *argument)
         if (!has_vision ||
             now_us - vision.timestamp_us > VISION_STALE_MS * 1000LL) {
             stop_motors();
-            if (context.state != TRANSPORT_FINISHED &&
+            if (context.state == TRANSPORT_WHITE_EXTRA_PUSH ||
+                context.state == TRANSPORT_PRETURN_ORANGE) {
+                enter_state(&context, TRANSPORT_FAULT);
+            } else if (context.state != TRANSPORT_FINISHED &&
                 context.state != TRANSPORT_TURN_TO_ORANGE &&
                 context.state != TRANSPORT_FAULT) {
                 enter_state(&context, TRANSPORT_WAIT_SCENE);
@@ -514,7 +579,9 @@ static void controller_task(void *argument)
             update_on_new_frame(&context, &vision, now_us);
         }
 
-        if (context.state == TRANSPORT_ALIGN_APPROACH &&
+        if ((context.state == TRANSPORT_STAGE_BEHIND_BALL ||
+             context.state == TRANSPORT_ALIGN_APPROACH ||
+             context.state == TRANSPORT_ALIGN_PUSH) &&
             context.turn_pulse_deadline_us != 0 &&
             now_us >= context.turn_pulse_deadline_us) {
             stop_motors();
@@ -541,39 +608,7 @@ static void controller_task(void *argument)
             enter_state(&context, TRANSPORT_FAULT);
         }
 
-        if (context.state == TRANSPORT_SETTLE &&
-            now_us >= context.phase_deadline_us) {
-            apply_velocity(0.0f, -BACK_AWAY_SPEED_MPS, 0.0f);
-            const int back_away_ms =
-                context.active_color == BALL_COLOR_WHITE
-                    ? WHITE_BACK_AWAY_MS : FINAL_BACK_AWAY_MS;
-            context.phase_deadline_us = now_us + back_away_ms * 1000LL;
-            ESP_LOGI(TAG, "back away for %d ms (%s leg)", back_away_ms,
-                     context.active_color == BALL_COLOR_WHITE
-                         ? "about 0.25 m" : "final release");
-            enter_state(&context, TRANSPORT_BACK_AWAY);
-        } else if (context.state == TRANSPORT_BACK_AWAY &&
-                   now_us >= context.phase_deadline_us) {
-            stop_motors();
-            if (context.active_color == BALL_COLOR_WHITE) {
-                context.active_color = BALL_COLOR_ORANGE;
-                s_requested_color = BALL_COLOR_ORANGE;
-                context.phase_deadline_us =
-                    now_us + ORANGE_SEARCH_TIMEOUT_MS * 1000LL;
-                enter_state(&context, TRANSPORT_TURN_TO_ORANGE);
-                apply_velocity(0.0f, 0.0f, ORANGE_SEARCH_TURN_RAD_S);
-            } else {
-                enter_state(&context, TRANSPORT_FINISHED);
-            }
-        } else if (context.state == TRANSPORT_TURN_TO_ORANGE &&
-                   now_us >= context.phase_deadline_us) {
-            ESP_LOGE(TAG, "orange-ball search timed out");
-            stop_motors();
-            enter_state(&context, TRANSPORT_FAULT);
-        } else if (context.state == TRANSPORT_FINISHED ||
-                   context.state == TRANSPORT_FAULT) {
-            stop_motors();
-        }
+        update_delivery_timers(&context, now_us);
 
         if (now_us >= context.next_log_us) {
             context.next_log_us = now_us + 1500000LL;

@@ -17,6 +17,7 @@
 #define STATUS_LOG_PERIOD_MS          500
 #define TFT_UPDATE_PERIOD_MS          200
 #define LOST_CONFIRM_MS               150
+#define CORNER_ADVANCE_MS             600
 #define SEARCH_TIMEOUT_MS             9000
 #define FIRST_CORNER_IGNORE_LINE_MS   600
 #define NORMAL_SEARCH_IGNORE_LINE_MS  400
@@ -41,15 +42,15 @@
 
 /* Kept for the existing logic: virtual camera black is represented as low. */
 #define IR_BLACK_LEVEL 0
-#define FORWARD_SPEED_MPS       0.04f
-#define ARC_FORWARD_SPEED_MPS   0.035f
+#define FORWARD_SPEED_MPS       0.03f
+#define ARC_FORWARD_SPEED_MPS   0.025f
 #define ARC_TURN_SPEED_RAD_S    0.20f
 #define INNER_TURN_SPEED_RAD_S  0.05f
 #define SEARCH_SPEED_RAD_S      0.25f
-#define LINE_STEER_KP           0.40f
-#define LINE_STEER_KD           0.08f
-#define LINE_STEER_MAX_OMEGA    0.20f
-#define LINE_STEER_DEADBAND     0.01f
+#define LINE_STEER_KP           0.22f
+#define LINE_STEER_KD           0.015f
+#define LINE_STEER_MAX_OMEGA    0.10f
+#define LINE_STEER_DEADBAND     0.015f
 #define LINE_ERROR_FILTER_ALPHA 0.60f
 
 #define IR_LEFT_OUTER_MASK  0x08U
@@ -59,6 +60,49 @@
 #define IR_MIDDLE_MASK (IR_LEFT_INNER_MASK | IR_RIGHT_INNER_MASK)
 
 static const char *TAG = "LINE_TRACK";
+
+/* One task owns all ultrasonic triggers throughout both missions. The line
+ * controller consumes fresh snapshots; the display reuses the same samples. */
+static portMUX_TYPE s_telemetry_lock = portMUX_INITIALIZER_UNLOCKED;
+static ultrasonic_sample_t s_telemetry_sample;
+static bool s_telemetry_ready;
+
+static bool telemetry_copy_new_sample(ultrasonic_sample_t *sample)
+{
+    portENTER_CRITICAL(&s_telemetry_lock);
+    const bool fresh = s_telemetry_ready &&
+        s_telemetry_sample.timestamp_us != sample->timestamp_us;
+    if (fresh) *sample = s_telemetry_sample;
+    portEXIT_CRITICAL(&s_telemetry_lock);
+    return fresh;
+}
+
+static void robot_telemetry_task(void *argument)
+{
+    (void)argument;
+    int64_t next_display_us = 0;
+    while (true) {
+        ultrasonic_sample_t sample = {0};
+        const esp_err_t error = ultrasonic_sensor_read(&sample);
+        if (error != ESP_OK) {
+            sample.valid = false;
+            sample.timestamp_us = esp_timer_get_time();
+            ESP_LOGW(TAG, "telemetry ultrasonic read failed: %s", esp_err_to_name(error));
+        }
+        portENTER_CRITICAL(&s_telemetry_lock);
+        s_telemetry_sample = sample;
+        s_telemetry_ready = true;
+        portEXIT_CRITICAL(&s_telemetry_lock);
+
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_display_us) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(tft_display_update_from_modules(&sample));
+            next_display_us = now_us + TFT_UPDATE_PERIOD_MS * 1000LL;
+        }
+        vTaskDelay(pdMS_TO_TICKS(ULTRASONIC_SAMPLE_PERIOD_MS));
+    }
+}
+
 
 typedef enum {
     TRACK_WAIT_START,
@@ -257,6 +301,8 @@ static infrared_data_t infrared_read(void)
 {
     static uint8_t history[4];
     static float error_filtered = 0.0f;
+    static uint32_t last_sequence = 0;
+    static infrared_data_t cached;
     camera_line_state_t camera_state;
 
     /* A camera that has not supplied a valid frame must look like white,
@@ -267,6 +313,8 @@ static infrared_data_t infrared_read(void)
         return data;
     }
 
+    if (camera_state.sequence == last_sequence) return cached;
+    last_sequence = camera_state.sequence;
     for (int i = 0; i < 4; ++i) {
         /* The camera is mounted facing the vehicle, so image-left/image-right
          * is the reverse of task 1's historical OUT4..OUT1 sensor order. */
@@ -297,6 +345,7 @@ static infrared_data_t infrared_read(void)
     data.raw_error = raw_error;
     data.line_pixels = camera_state.line_pixels;
     data.frame_sequence = camera_state.sequence;
+    cached = data;
 
     return data;
 }
@@ -359,12 +408,18 @@ static tracking_state_t track_visible_line(const infrared_data_t *ir,
     static float prev_error = 0.0f;
     static int64_t prev_us = 0;
     const int64_t now_us = esp_timer_get_time();
-    const float dt_s = (float)(now_us - prev_us) / 1000000.0f;
-    const float d_error = dt_s > 0.0f ? (ir->error - prev_error) / dt_s : 0.0f;
-    prev_error = ir->error;
-    prev_us = now_us;
-
-    float omega = -LINE_STEER_KP * ir->error - LINE_STEER_KD * d_error;
+    static uint32_t prev_sequence = 0;
+    static float held_omega = 0.0f;
+    if (ir->frame_sequence != prev_sequence) {
+        const float dt_s = (float)(now_us - prev_us) / 1000000.0f;
+        const float d_error = prev_us != 0 && dt_s > 0.0f && dt_s < 0.5f
+            ? (ir->error - prev_error) / dt_s : 0.0f;
+        held_omega = -LINE_STEER_KP * ir->error - LINE_STEER_KD * d_error;
+        prev_error = ir->error;
+        prev_us = now_us;
+        prev_sequence = ir->frame_sequence;
+    }
+    float omega = held_omega;
     if (omega > LINE_STEER_MAX_OMEGA) {
         omega = LINE_STEER_MAX_OMEGA;
     } else if (omega < -LINE_STEER_MAX_OMEGA) {
@@ -484,6 +539,12 @@ static tracking_state_t tracking_update(const infrared_data_t *ir,
             return context->state;
         }
 
+        /* Advance to the corner before starting an in-place turn. */
+        if (lost_ms < LOST_CONFIRM_MS + CORNER_ADVANCE_MS) {
+            ESP_ERROR_CHECK(car_control_forward(FORWARD_SPEED_MPS));
+            context->state = TRACK_GAP_HOLD;
+            return context->state;
+        }
         return begin_search(context, now_us);
     }
 
@@ -545,8 +606,8 @@ static bool avoidance_update(avoidance_context_t *avoidance,
                              const infrared_data_t *ir, int64_t now_us)
 {
     if (avoidance->state == AVOID_IDLE) {
-        if (now_us >= avoidance->next_sample_us) {
-            ESP_ERROR_CHECK(ultrasonic_sensor_read(&avoidance->latest_sample));
+        if (now_us >= avoidance->next_sample_us &&
+            telemetry_copy_new_sample(&avoidance->latest_sample)) {
             avoidance->next_sample_us =
                 avoidance->latest_sample.timestamp_us +
                 ULTRASONIC_SAMPLE_PERIOD_MS * 1000LL;
@@ -577,8 +638,8 @@ static bool avoidance_update(avoidance_context_t *avoidance,
 
     switch (avoidance->state) {
     case AVOID_STRAFE_LEFT:
-        if (now_us >= avoidance->next_sample_us) {
-            ESP_ERROR_CHECK(ultrasonic_sensor_read(&avoidance->latest_sample));
+        if (now_us >= avoidance->next_sample_us &&
+            telemetry_copy_new_sample(&avoidance->latest_sample)) {
             avoidance->next_sample_us =
                 avoidance->latest_sample.timestamp_us +
                 ULTRASONIC_SAMPLE_PERIOD_MS * 1000LL;
@@ -703,6 +764,9 @@ void app_main(void)
     ESP_ERROR_CHECK(tft_display_init());
     ESP_ERROR_CHECK(infrared_init());
     ESP_ERROR_CHECK(ultrasonic_sensor_init(&ultrasonic_config));
+    ESP_ERROR_CHECK(xTaskCreatePinnedToCore(robot_telemetry_task, "robot_telemetry",
+                                           4096, NULL, 1, NULL, tskNO_AFFINITY)
+                       == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(car_control_stop());
 
     tracking_context_t tracking = {

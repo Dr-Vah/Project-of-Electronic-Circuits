@@ -521,7 +521,7 @@ esp_err_t tft_display_show_camera_debug(const uint16_t *pixels,
     ESP_RETURN_ON_ERROR(tft_fill_rect(0, DEBUG_IMAGE_HEIGHT, TFT_WIDTH,
                                        TFT_HEIGHT - DEBUG_IMAGE_HEIGHT,
                                        black_color), TAG, "clear debug text failed");
-    ESP_RETURN_ON_ERROR(tft_draw_text_line_scaled(2, 122, "BIN CAMERA", white,
+    ESP_RETURN_ON_ERROR(tft_draw_text_line_scaled(2, 122, "CY:ROI MG:AX R:LINE", white,
                                                    black_color, 1), TAG,
                         "draw camera title failed");
     snprintf(line, sizeof(line), "1:%3u%%%c 2:%3u%%%c", dark_percent[0],
