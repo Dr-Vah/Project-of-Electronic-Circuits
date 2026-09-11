@@ -1,0 +1,10 @@
+build/
+sdkconfig
+sdkconfig.old
+tests/*.exe
+.tls/
+main/tls/
+build-ble.log
+build-integrated.log
+build-camera-fix.log
+miniprogram/project.private.config.json

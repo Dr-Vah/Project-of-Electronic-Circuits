@@ -1,0 +1,76 @@
+<view class="page" style="padding-top:{{navPadTop}}px">
+  <view class="header">
+    <view class="brand">遥控驾驶舱</view>
+    <view class="conn {{connected ? 'on' : ''}}">{{connected ? '已连接' : '未连接'}}</view>
+    <view class="header-actions">
+      <button class="primary" bindtap="connect" disabled="{{connecting || connected}}">{{connecting ? '搜索中' : '连接'}}</button>
+      <button bindtap="connectWifi">连WiFi</button>
+      <button bindtap="toggleDetails">{{details ? '收起' : '状态'}}</button>
+    </view>
+  </view>
+
+  <view class="video-stage">
+    <image wx:for="{{frames}}" wx:key="*this" class="camera {{flipped ? 'flipped' : ''}} {{videoFresh ? '' : 'waiting-image'}}" src="{{item}}" mode="aspectFit" data-path="{{item}}" bindload="frameLoaded" binderror="frameError" />
+    <view wx:if="{{!videoFresh}}" class="video-placeholder">
+      <view class="viewfinder">⌗</view>
+      <view>{{videoText}}</view>
+    </view>
+    <view class="video-actions">
+      <button bindtap="flipVideo">翻转</button>
+      <button bindtap="toggleVideo">{{videoOn ? '暂停' : '开启'}}</button>
+    </view>
+  </view>
+
+  <view class="tabs">
+    <view class="tab {{mode === 'joystick' ? 'selected' : ''}}" data-mode="joystick" bindtap="mode">摇杆</view>
+    <view class="tab {{mode === 'tilt' ? 'selected' : ''}}" data-mode="tilt" bindtap="mode">体感</view>
+  </view>
+
+  <view class="control">
+    <view wx:if="{{mode === 'joystick'}}" class="joy-area">
+      <view id="joystick" class="joystick" catchtouchstart="joyStart" catchtouchmove="joyMove" catchtouchend="joyEnd" catchtouchcancel="release">
+        <view class="cross cross-h"></view>
+        <view class="cross cross-v"></view>
+        <view class="knob" style="transform:translate({{joyX}}px, {{joyY}}px)"></view>
+      </view>
+    </view>
+    <view wx:else class="tilt-area">
+      <view class="sensor">{{sensor}}</view>
+      <button class="calibrate {{tiltLatched ? 'active' : ''}}" bindtap="toggleTilt">{{tiltLatched ? '停止' : '开始'}}</button>
+    </view>
+  </view>
+
+  <view class="turn-row">
+    <view class="turn" data-sign="1" catchtouchmove="preventScroll" catchtouchstart="turnStart" catchtouchend="turnEnd" catchtouchcancel="release"><text>↶</text>左转</view>
+    <view class="turn" data-sign="-1" catchtouchmove="preventScroll" catchtouchstart="turnStart" catchtouchend="turnEnd" catchtouchcancel="release"><text>↷</text>右转</view>
+  </view>
+
+  <view class="bottom-row">
+    <view class="speed">
+      <view class="speed-label">速度选择</view>
+      <view class="segments">
+        <button class="{{percent === 50 ? 'selected' : ''}}" data-scale="0.5" bindtap="speed">低</button>
+        <button class="{{percent === 75 ? 'selected' : ''}}" data-scale="0.75" bindtap="speed">中</button>
+        <button class="{{percent === 100 ? 'selected' : ''}}" data-scale="1" bindtap="speed">高</button>
+      </view>
+    </view>
+    <picker range="{{faceOptions}}" value="{{faceIndex}}" bindchange="chooseFace" disabled="{{!connected}}">
+      <view class="face-picker">{{statusFresh ? faceOptions[faceIndex] : '表情'}}<text>⌄</text></view>
+    </picker>
+  </view>
+
+  <view class="status-line">{{status}}</view>
+
+  <view wx:if="{{details}}" class="details">
+    <view class="details-heading"><text>状态</text><button bindtap="toggleDetails">关闭</button></view>
+    <scroll-view scroll-y class="details-body">
+      <view>{{status}}</view>
+      <view class="muted">{{sensor}}</view>
+      <view class="muted">{{wifiText}}</view>
+      <view class="muted">{{videoText}}</view>
+      <view class="setting"><text>罗盘</text><switch checked="{{useCompass}}" bindchange="toggleCompass" color="#07c160"/></view>
+      <button bindtap="retrySensors">重启传感器</button>
+      <button bindtap="disconnect" disabled="{{!connecting && !connected}}">断开</button>
+    </scroll-view>
+  </view>
+</view>

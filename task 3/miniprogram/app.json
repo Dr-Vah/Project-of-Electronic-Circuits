@@ -1,0 +1,6 @@
+{
+  "pages": ["pages/index/index"],
+  "lazyCodeLoading": "requiredComponents",
+  "window": {"navigationBarTitleText": "遥控驾驶舱", "navigationBarBackgroundColor": "#ffffff", "navigationBarTextStyle":"black"},
+  "style": "v2"
+}
